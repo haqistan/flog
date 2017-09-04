@@ -23,7 +23,7 @@ use Getopt::Std;
 use POSIX qw(floor strftime);
 use vars qw($VERBOSE $VERSION);
 
-$VERSION = '0.1.13';
+$VERSION = '0.1.14';
 
 ########################################################################
 # MultimarkdownFile: A class whose instances represent parsed
@@ -527,8 +527,8 @@ sub VERSION_MESSAGE { print STDERR qq|flog v.$VERSION\n|; }
 sub HELP_MESSAGE {
 	print STDERR <<__HeLP__;
 purpose: static blog generator based on multimarkdown
-usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt] [-U url] [-N name]
-            
+usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt]
+            [-C css] [-U url] [-N name] [-A author] [-t file]
   bool opts:
     -v                  verbose
     -d			show posts marked as drafts (def: no)
@@ -1457,6 +1457,7 @@ in the docroot.
 
 Z<>
 
+  0.1.14  03 Sep 2017	attila	clerical error
   0.1.13  03 Sep 2017	attila	-b => -O, new -b = $bare_pages,
 				fix -C and -N, add hidden pages
   0.1.12  04 Jul 2017   attila  dump_tags
