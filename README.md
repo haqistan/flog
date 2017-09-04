@@ -28,5 +28,3 @@ $ perl Makefile.PL
 $ make
 $ doas make install
 ```
-
-YMMV.
