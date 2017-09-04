@@ -1,0 +1,1476 @@
+#!/usr/bin/perl
+##
+# flog - static blog generator using multimarkdown
+##
+# Copyright (C) 2016,2017 by attila <attila@stalphonsos.com>
+# 
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+# WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+# AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+# DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+# PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+# TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+# PERFORMANCE OF THIS SOFTWARE.
+##
+use Modern::Perl;
+use File::Find;				# find()
+use Getopt::Std;
+use POSIX qw(floor strftime);
+use vars qw($VERBOSE $VERSION);
+
+$VERSION = '0.1.13';
+
+########################################################################
+# MultimarkdownFile: A class whose instances represent parsed
+# multimarkdown files
+
+package MultimarkdownFile;
+use Modern::Perl;
+use Time::ParseDate;
+use Scalar::Util qw(looks_like_number);
+
+sub new {
+	my $class = shift(@_);
+	my $self = {
+		filename => shift(@_),
+		meta => {},		# actual keys found in file
+		content => [],		# one line per entry
+		wordcount => 0,
+		options => { @_ }
+	};
+	return bless($self,$class)->parse();
+}
+
+sub opt { #imal
+	exists($_[0]->{'options'}->{$_[1]}) ?
+		$_[0]->{'options'}->{$_[1]} : $_[2];
+}
+
+# helper for markdownify: blockquotify a multi-line string
+sub bq { join("\n", map { "> $_" } split(/[\r\n]+/, "@_")) . "\n" }
+
+# helper for markdownify: deal with funky links
+sub lq {
+	my($txt,$url) = @_;
+#	::debug("txt=|$txt| url=|$url|");
+	if ($url =~ /^page:(.*)$/) {
+		my $pg = $1;
+		if ($pg !~ /^\//) {
+			$pg =~ s/\s/_/gs;
+			$url = "/${pg}";
+			$url .= ".html" unless $url =~ /\.\w+$/;
+		} else {
+			$url = $pg;
+		}
+	} elsif ($url =~ /^wiki(|pedia|quote|media|source):(.*)$/) {
+		my($site,$name) = ($1,$2);
+		$site ||= "pedia";
+		my $lang = "en";
+		($lang,$name) = ($1,$2) if $name =~ /^(\w\w):(.*)$/;
+		$name =~ s/\s/_/gs;
+		$url = "https://${lang}.wiki${site}.org/wiki/$name";
+	} elsif ($url =~ /^(man|obsdman):(.*)$/) {
+		my $pg = $2;
+		$url = "https://man.openbsd.org/$pg";
+	} elsif ($url =~ /^youtube:(.*)$/) {
+		$url = "https://www.youtube.com/watch?v=$1";
+	} elsif ($url =~ /^github:(.*)$/) {
+		$url = "https://github.com/$1";
+	} elsif ($url =~ /^\@(.*)$/) {
+		$url = "https://twitter.com/$1";
+	}
+	return "[$txt]($url)";
+}
+
+# deal with stray html/mmd in old posts, some of which is okay
+sub markdownify {
+	my($html) = @_;
+	my $md = $html;
+	$md =~ s,\r,\n,gs;
+	$md =~ s,<h(\d).*?>(.*?)</h\1>,"#" x $1." $2 "."#" x $1,gsei;
+	$md =~ s/\[([^\]]+?)\]\(([^\)]+?)\)/lq($1,$2)/gse;
+	$md =~ s/<a href=(['"])(.*?)\1>(.+?)<\/a>/lq($3,$2)/gsei;
+	$md =~ s,<tt>(.*?)</tt>,`$1`,gsi;
+#	$md =~ s,<pre [^>]+>,```,gsi;
+#	$md =~ s,</pre>,```,gsi;
+	$md =~ s,<blockquote>(.*?)</blockquote>,bq($1),gsei;
+	$md =~ s,<p>,\n\n,gsi;
+	$md =~ s,</p>,\n\n,gsi;
+	$md =~ s,<br/>,\n,gsi;
+	$md =~ s,<br>,\n,gsi;
+	$md =~ s,<font[^>]+>(.*?)</font>,$1,gsi;
+	$md =~ s,(<i>|</i>|<em>|</em>),*,gsi;
+	$md =~ s,(<b>|</b>),**,gsi;
+	$md =~ s,&nbsp;, ,gsi;
+	$md =~ s,&amp;,&,gsi;
+#	$md =~ s,&gt;,>,gsi;
+#	$md =~ s,&lt;,<,gsi;
+	return $md;
+}
+
+sub get_filename { shift->{'filename'}; }
+sub is_post { shift->get_filename =~ /^posts\// }
+sub get_content {
+	my $string = join("\n", @{shift->{'content'}});
+	return markdownify($string);
+}
+
+sub get_wordcount { shift->{'wordcount'}; }
+
+# strip text down to the bone
+sub strip_string {
+	my($string,$mode) = @_;
+	$mode = 1 unless defined $mode;
+	$string =~ s,<(\w+|\/\w+)>,,gs;		# html tags
+	$string =~ s,\[(.*?)\]\(.*?\),$1,gs;	# md/mmd links
+	$string =~ s/[,$%^\*\(\)\[\]!\@\#\+;\<\>=~\`]/ /gs; # most punct
+	$string =~ s/[\-'"\.\/:\?]/ /gs if $mode; # funky punct
+	$string =~ s/ +/ /gs;			  # multi space => 1 space
+	$string =~ s/(^\s+|\s+$)//gs;		  # leading/trailing space
+	return $string;
+}
+
+sub word_count { scalar(split(/\s/,strip_string(shift))) }
+
+sub set_meta {
+	my($self,$name,$val) = @_;
+	if (!defined($self->{'meta'}->{$name})) {
+		$self->{'meta'}->{$name} = $val;
+	} elsif (ref($self->{'meta'}->{$name}) eq 'ARRAY') {
+		push(@{$self->{'meta'}->{$name}}, $val);
+	} else {
+		$self->{'meta'}->{$name} = [
+			$self->{'meta'}->{$name}, $val
+		    ];
+	}
+	return $self;
+}
+
+sub get_meta {
+	my($self,$what,$default) = @_;
+	my $val = $default;
+	if (defined($self->{'meta'}->{$what})) {
+		$val = ref($self->{'meta'}->{$what}) ?
+		    join("\n", @{$self->{'meta'}->{$what}}) :
+		    $self->{'meta'}->{$what};
+	}
+	return $val;
+}
+
+sub get_meta_date { parsedate(shift->get_meta(@_)) || 0 }
+
+sub get_meta_num {
+	my($self,$what,$default) = @_;
+	$default ||= 0;
+	my $val = $default;
+	if (defined($self->{'meta'}->{$what}) &&
+	    looks_like_number($self->{'meta'}->{$what})) {
+		$val = 0 + $self->{'meta'}->{$what};
+	}
+	return $val;
+}
+
+sub get_meta_bool {
+	my($self,$what,$default) = @_;
+	$default ||= 0;
+	my $val = $default;
+	if (defined($self->{'meta'}->{$what})) {
+		my $raw = $self->{'meta'}->{$what};
+		if (looks_like_number($raw)) {
+			$val = 0 + $raw;
+		} elsif ($raw =~ /^true|yes$/i) {
+			$val = 1;
+		} else {
+			$val = 0;
+		}
+	}
+	return $val;
+}
+
+sub get_sort_title {
+	my($self) = @_;
+	lc(strip_string($self->get_meta('title','')));
+}
+
+sub get_tags {
+	my($self) = @_;
+	unless (defined($self->{'tags'})) {
+		my $rawval = $self->{'meta'}->{'tags'} || '';
+		$rawval =~ s/\s//gs;
+		$self->{'tags'} = { map { $_ =~ s/\s//gs; lc($_) => 1 }
+				    split(/,\s*/,$rawval) };
+	}
+	return sort keys(%{$self->{'tags'}});
+}
+
+sub add_content {
+	my($self,$line) = @_;
+	push(@{$self->{'content'}}, $line);
+	return word_count($line);
+}
+
+sub parse {
+	my($self) = @_;
+	my $file = $self->{'filename'};
+	open(MMD, "$file") or die "$file: $!";
+	::debug("processing mmd: $file");
+	my($title,$name,$by,$pubd,$edit,$nwords,$in_meta,@content);
+	$in_meta = 1;
+	$nwords = 0;
+	while (defined(my $line = <MMD>)) {
+		chomp($line);
+		if ($in_meta) {
+			::debug("$file parsing meta: |$line|");
+			if (!$line || $line =~ /^\s+$/) {
+				$in_meta = 0;
+			} elsif ($line =~ /^([^:]+):\s*(\S.*)$/) {
+				my($var,$val) = ($1,$2);
+				$var = lc($var);
+				::debug("... meta $var = |$val|");
+				chomp($val);
+				$self->set_meta($var,$val);
+			} # else an inclusion or something, skip it
+		} else {
+			$nwords += $self->add_content($line);
+		}
+	}
+	close(MMD);
+	return undef unless !$in_meta && $nwords > 0;
+	$self->{'wordcount'} = $nwords;
+	return $self;
+}
+
+sub extract_summary_para {
+	my($self) = @_;
+	my @content = @{$self->{'content'}};
+	my $string = strip_string(join("\n",@content),0);
+	@content = split(/\n/,$string);
+	my @summ = ();
+	my $wc = 0;
+	my $nparas = 0;
+	while (($wc < $::max_summary_word_count) && @content) {
+		my $line = shift(@content);
+		last if ($line eq '') && (++$nparas > $::max_summary_paras);
+		push(@summ,$line);
+		$wc += scalar(split(/ /,$line));
+#		::debug("summary += $wc |$line|");
+	}
+	return @summ;
+}
+
+sub post_summary {
+	my($self,$do_para,$prev,$next) = @_;
+	$do_para = 0 if $self->get_meta('nosumm',0);
+	my $title = $self->get_meta('title');
+	my $name = $self->get_meta('name');
+	my $by = $self->get_meta('author',$::default_author);
+	my $pubd = ::ts($self->get_meta_date('date'));
+	my $edit = ::ts($self->get_meta_date('edit'));
+	my $nwords = $self->get_wordcount();
+	if (!$name) {
+		my @tmp = split(/\//,$self->get_filename());
+		$name = $tmp[-1];
+		$name =~ s/\.\w+$//;
+	}
+	if (!$title) {
+		$title = $name;
+		$title =~ s/-/ /;
+		$title = ucfirst($title);
+	}
+	my $path = $self->post_path('.html');
+	my $url = ::site_url($path);
+	my $base = qq{$nwords words by $by written on $pubd, last edit: $edit};
+	my @postags = $self->get_tags();
+	if (@postags) {
+		$base .= ", tags: " .
+		    join(", ", map { ::tag_link($_) } @postags);
+	}
+	my $links = $self->nav_links($prev,$next);
+	$links = qq{[\%sep] $links} if $links;
+	my @summ = ("*${base}*",$links,"");
+	push(@summ,
+	     $self->extract_summary_para(),
+		"... [read more]($url)",""
+	    ) if $do_para;
+	return @summ;
+}
+
+sub chapter_summary {
+	my($self,$do_para,$prev,$next) = @_;
+	$do_para = 0 if $self->get_meta('nosumm',0);
+	my $title = $self->get_meta('title');
+	my $name = $self->get_meta('name');
+	my $nwords = $self->get_wordcount();
+	if (!$name) {
+		my @tmp = split(/\//,$self->get_filename());
+		$name = $tmp[-1];
+		$name =~ s/\.\w+$//;
+	}
+	if (!$title) {
+		$title = $name;
+		$title =~ s/-/ /;
+		$title = ucfirst($title);
+	}
+	my $path = $self->chapter_path('.html');
+	my $url = ::site_url($path);
+	my $base = qq{$nwords words};
+	my @summ = ("*${base}*","");
+	push(@summ,
+	     $self->extract_summary_para(),
+		"... [full chapter]($url)",""
+	    ) if $do_para;
+	return @summ;
+}
+
+sub write_common {
+	my($self,$base_dir,$path,$customizer,$customizer2) = @_;
+	my $outfile = $base_dir;
+	$outfile ||= '.';
+	$outfile .= '/' unless $outfile =~ /\/$/ or $path =~ /^\//;
+	$outfile .= $path;
+	my @parts = split(/\//, $outfile);
+	pop(@parts); # no filename
+	my $dirpath = '';
+	my $rootrel = '';
+	while (defined(my $dir = shift(@parts))) {
+		$dirpath .= $dir;
+		if ($dirpath && !(-d $dirpath)) {
+			die "could not mkdir $dirpath: $!"
+			    unless mkdir($dirpath);
+		}
+		$dirpath .= '/';
+		$rootrel .= '../' if @parts > 1;
+	}
+	my $saw_css = 0;
+	open(OUT, "> $outfile") or die "opening $outfile for writing: $!";
+	foreach my $meta (sort keys(%{$self->{'meta'}})) {
+		next if $meta =~ $::ignored_meta_re;
+		my $meta_line = ucfirst($meta).": ";
+		my $val = $self->{'meta'}->{$meta};
+		$meta = 'CSS' if $meta eq 'css';
+		if (!ref($val)) {
+			$meta_line .= $val;
+			$meta_line .= " - $::blogname" if lc($meta) eq 'title';
+		} else {
+			$meta_line .= $val->[0];
+			my $i = 1;
+			while ($i < scalar(@$val)) {
+				$meta_line .= "\n" . ucfirst($meta) . ": ";
+				$meta_line .= $val->[$i];
+				++$i;
+			}
+		}
+		## handle CSS specially. if they say e.g. 'flogger.css'
+		## in a post, that means they want the top-level flogger.css
+		if ($meta eq 'CSS' && $val !~ /^[\/\.]/) {
+			$meta_line = qq{CSS: ${rootrel}${val}};
+			$saw_css = 1;
+		}
+		print OUT "$meta_line\n";
+	}
+	print OUT "CSS: ${rootrel}$::default_css\n" unless $saw_css;
+	print OUT "{{${rootrel}meta.md}}\n\n";
+	&$customizer($self,\*OUT,$rootrel) if $customizer;
+	print OUT $self->get_content() . "\n";
+	&$customizer2($self,\*OUT,$rootrel) if $customizer2;
+	print OUT "\n{{${rootrel}footer.md}}\n";
+	close(OUT);
+	return (::mmd($outfile));
+}
+
+sub nav_link_text {
+	my($self,$which,$what) = @_;
+	$what ||= "post";
+	my $text = ucfirst($which);
+	$text .= " $what: ".$self->get_meta('title');
+	return $text;
+}
+
+sub nav_links {
+	my($self,$prev,$next,$what) = @_;
+	$what ||= 'post';
+	my $pather = $what . '_path';
+	my $links = '';
+	if ($prev) {
+		my $text = $prev->nav_link_text("previous",$what);
+		my $link = $prev->$pather('.html');
+		$links .= qq{[$text]($link)};
+	}
+	if ($next) {
+		$links .= ' [%sep] ' if $links;
+		my $text = $next->nav_link_text("next",$what);
+		my $link = $next->$pather('.html');
+		$links .= qq{[$text]($link)};
+	}
+	return $links;
+}
+
+sub thing_path {
+	my($self,$ext,$intermediate) = @_;
+	$ext ||= '.md';
+	my @inpath = split(/\//, $self->get_filename());
+	my $name = $self->get_meta('name');
+	$name ||= $inpath[-1];
+	$name =~ s/\.\w+$//;
+	my @outpath = ('');
+	shift(@inpath);
+	pop(@inpath);
+	push(@outpath,&$intermediate($self)) if $intermediate;
+	push(@outpath,@inpath) if @inpath && !$self->is_post;
+	push(@outpath,"${name}${ext}");
+	::debug($self->get_filename()." thing_path($ext) ".join('/',@outpath));
+	return wantarray ? @outpath : join('/',@outpath);
+}
+
+sub post_path {
+	shift->thing_path(
+		shift,
+		sub { 
+			my($thing) = @_;
+			my $t = $thing->get_meta_date('date');
+			(::ts($t,'%Y'),::ts($t,'%m'),::ts($t,'%d'));
+		}
+	    );
+}
+
+sub page_path { shift->thing_path(shift) }
+
+sub chapter_path {
+	my($self,$ext) = @_;
+	$self->thing_path($ext,sub { ($self->opt('grouping','book').'s') });
+}
+
+sub is_site_index { (split(/\//,shift->get_filename()))[-1] eq 'index.md' }
+
+sub write_page {
+	my($self,$base_dir) = @_;
+	my $path = $self->page_path();
+	my $summ = $self->is_site_index() ? undef :
+	    sub {
+		    my($self,$fh,$rootrel) = @_;
+		    my $edit = ::ts($self->get_meta_date('edit'));
+		    print $fh "\n*Updated on ${edit}*\n\n";
+	};
+	$self->write_common($base_dir,$path,undef,$summ);
+}
+
+sub write_post {
+	my($self,$base_dir,$prev,$next) = @_;
+	my $path = $self->post_path();
+	$self->write_common(
+		$base_dir,$path,
+		sub {
+			my($self,$fh,$rootrel) = @_;
+			my $title = $self->get_meta('title');
+			print $fh "# [$::blogname](/) #\n\n";
+			print $fh "{{${rootrel}pages.md}}\n\n";
+			print $fh "## $title ##\n";
+			print $fh join(
+				"\n",
+				$self->post_summary(0,$prev,$next)
+			    )."\n";
+			print $fh "<hr>\n\n";
+		}
+	    );
+}
+
+sub write_chapter {
+	my($self,$base_dir,$prev,$next) = @_;
+	my $path = $self->chapter_path();
+	my @parts = split(/\//,$path);
+	my $fn = pop(@parts);
+	shift(@parts);
+	shift(@parts);
+	my $outer = join('/',@parts);
+	my $subdir = $self->opt('grouping','book').'s';
+	my $unit = $self->opt('unit','chapter');
+	::debug("write_chapter($base_dir,$outer): path=$path fn=$fn");
+	$self->write_common(
+		$base_dir,$path,
+		sub {
+			my($self,$fh,$rootrel) = @_;
+			my $title = $self->get_meta('title');
+			print $fh "# [$::blogname](/) #\n\n";
+			print $fh "{{${rootrel}pages.md}}\n\n";
+			if ($fn eq 'index.md') {
+				my $desc = $self->get_meta('description');
+				if ($desc) {
+					print $fh "## $title: $desc ##\n\n";
+				} else {
+					print $fh "## $title ##\n\n";
+				}
+			} else {
+				print $fh
+				    "## [$outer](/$subdir/$outer) ##\n\n";
+				print $fh "### $title ###\n";
+				print $fh
+				    $self->nav_links($prev,$next,$unit)."\n";
+				print $fh "\n";
+			}
+		}
+	    );
+}
+
+########################################################################
+
+package main;
+
+# c.f. Getopt::Std pod play nice with Getopt::Std so we get decent
+# output for --help etc.
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+sub VERSION_MESSAGE { print STDERR qq|flog v.$VERSION\n|; }
+sub HELP_MESSAGE {
+	print STDERR <<__HeLP__;
+purpose: static blog generator based on multimarkdown
+usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt] [-U url] [-N name]
+            
+  bool opts:
+    -v                  verbose
+    -d			show posts marked as drafts (def: no)
+    -b                  process "bare" pages in . (def: no)
+    -B                  do not process the books/ subdirectory
+    -O                  ONLY process books/, not posts (def: no)
+    -P                  do not process the papers/ subdirectory
+  opts with args:	
+    -C css		set default CSS to css (def: flogger.css)
+    -D dir              output base dir (def: .\/tmp)
+    -S int              max summary word count (def: 50)
+    -p int              max summary paragraphs (def: 2)
+    -I int              max posts on main page (def: 20)
+    -T fmt              strftime(3) fmt for dates
+    -U url              base URL for blog (def: none)
+    -N name             name of blog (def: flogger)
+    -A author           default author (def: attila)
+    -t file             dump tags sorted by use count to file
+  usage notes:
+    No args needed, required or wanted.  You run this program in the
+    directory where your blog lives.  It generates a directory structure
+    populated with multimarkdown files under the output base dir
+    and prints out the multimarkdown commands needed to generate the
+    static site on stdout.  A typical invocation:
+        \$ flog | sh
+__HeLP__
+}
+sub usage {
+        print STDERR "$0: ERROR: @_\n" if @_;
+        HELP_MESSAGE();
+        exit(@_ ? 1 : 0);
+}
+
+our %opts;
+our $max_summary_word_count = 40;
+our $max_summary_paras = 2;
+our $max_posts_in_index = 20;
+our $nice_datetime_fmt = '%Y-%m-%d';
+our $out_base_dir;
+our $out_posts_subdir;
+our $url_base;
+our @all_posts;
+our @all_pages;
+our %all_tags;
+our $multimarkdown = 'multimarkdown';
+our $list_separator = '[%sep]';
+our $blogname = 'haqistan';
+our $default_author = 'attila';
+our $default_css = 'flogger.css';
+our $dump_tags;
+our $bare_pages = 0;
+our $books_only = 0;
+our $no_books = 0;
+our $show_drafts = 0;
+our $no_papers = 0;
+our $ignored_meta_re = qr/^(base\s+header\s+level|latex\s+.*)$/i;
+
+getopts('bBOPdvA:S:T:D:U:p:t:I:C:N:', \%opts);
+$VERBOSE = $opts{'v'};
+$show_drafts = $opts{'d'};
+$max_summary_word_count = int($opts{'S'})	if defined($opts{'S'});
+$max_summary_paras = int($opts{'p'})		if defined($opts{'p'});
+$nice_datetime_fmt = $opts{'T'}			if defined($opts{'T'});
+$out_base_dir = $opts{'D'}			if defined($opts{'D'});
+$out_base_dir ||= './tmp';
+$url_base = $opts{'U'}				if defined($opts{'U'});
+if ($url_base) {
+	$url_base .= '/' unless $url_base =~ /\/$/;
+}
+$max_posts_in_index = int($opts{'I'})		if defined($opts{'I'});
+$blogname = $opts{'N'}				if defined($opts{'N'});
+$default_author = $opts{'A'}			if defined($opts{'A'});
+$default_css = $opts{'C'}			if defined($opts{'C'});
+$dump_tags = $opts{'t'}				if defined($opts{'t'});
+$no_papers = $opts{'P'};
+$bare_pages = $opts{'b'};
+$no_books = $opts{'B'};
+$books_only = $opts{'O'};
+usage("cannot specify both -O and -B")		if $no_books && $books_only;
+
+our $debug_sub = $VERBOSE ? sub { warn("# @_\n"); } : sub { };
+sub debug { &$debug_sub(@_); }
+
+# ts [$time_t [,$fmt]]
+# if not given $time_t defaults to the current time
+# if not given $fmt defaults to $nice_datetime_fmt
+sub ts {strftime(@_ > 1? $_[1]: $nice_datetime_fmt,localtime(@_? $_[0]: time))}
+
+# for calls to sort:
+sub by_date_asc { (stat($a))[9] <=> (stat($b))[9] }
+sub by_date_rev { (stat($b))[9] <=> (stat($a))[9] }
+sub by_pubd_rev { $b->get_meta_date('date') <=> $a->get_meta_date('date') }
+sub by_pubd_asc { $a->get_meta_date('date') <=> $b->get_meta_date('date') }
+sub by_order_asc{ $a->get_meta_num('order') <=> $b->get_meta_num('order') }
+sub by_title	{ $a->get_sort_title() cmp $b->get_sort_title() }
+sub by_featured { $a->get_meta_num('featured')<=>$b->get_meta_num('featured') }
+
+# the usual sub
+sub plural {
+	my($i,$t,$tp) = @_;
+	$tp ||= "${t}s";
+	return sprintf(qq{%d %s}, $i, ($i == 1) ? $t : $tp);
+}
+
+our $MINUTES = 60;
+our $HOURS = $MINUTES * 60;
+our $DAYS = $HOURS * 24;
+our $WEEKS = $DAYS * 7;
+our $YEARS = $DAYS * 365;
+
+# seconds => human-readable elapsed time (granularity of 1 day)
+sub elapsed {
+	my $deltat = abs(int(shift(@_)));
+	return "one day" if !$deltat;
+	my $dt = "";
+	my $tack = sub {
+		$dt .= ", " if $dt;
+		$dt .= shift;
+	};
+	if ($deltat > $YEARS) {
+		my $n = floor($deltat / $YEARS);
+		$deltat -= $n * $YEARS;
+		&$tack(plural($n,"year")) if $n > 0;
+	}
+	if ($deltat > $WEEKS) {
+		my $n = floor($deltat / $WEEKS);
+		$deltat -= $n * $WEEKS;
+		&$tack(plural($n,"week")) if $n > 0;
+	}
+	if ($deltat > $DAYS) {
+		my $n = floor($deltat / $DAYS);
+		$deltat -= $n * $DAYS;
+		&$tack(plural($n,"day")) if $n > 0;
+	}
+	$dt ||= "less than a day";
+	return $dt;
+}
+
+# return command to invoke multimarkdown
+sub mmd {
+	my($in,$out);
+	if (@_ == 2) {
+		($in,$out) = @_;
+	} elsif (@_ == 1) {
+		($in) = @_;
+		$out = $in;
+		$out =~ s/\.(md|mmd)$/.html/;
+	} else {
+		die "mmd called with ".scalar(@_)." args: @_";
+	}
+	return qq{${multimarkdown} -t html ${in} > ${out}};
+}
+
+# blow a bunch of text chunks into an output file, one chunk per line
+sub chunk_out {
+	my($outfile,@chunks) = @_;
+	open(OUT, "> $outfile") or die "$outfile: $!";
+	print OUT join("\n",@chunks)."\n\n";
+	close(OUT);
+}
+
+# like chunk_out but understands paths in the archive section
+sub archive_chunk_out {
+	my($outfile,@chunks) = @_;
+	my $fn = $outfile;
+	$fn =~ s/^${out_base_dir}\/archives\///;
+	my @parts = split(/\//,$fn);
+	my $rootrel = join('/',('..') x scalar(@parts)) . '/';
+	my @preamble = ("Title: Archives",
+			"CSS: ${rootrel}${default_css}",
+			"Date: ".ts(),"Author: flog v.${VERSION}",
+			"{{${rootrel}meta.md}}","",
+			"# [$blogname](/) #","",
+			"{{${rootrel}pages.md}}","");
+	if ($parts[0] eq 'tags') {
+		if ($parts[1] eq 'index.md') {
+			push(@preamble,"## All Tags ##");
+			$preamble[0] = "Title: Archives: All Tags";
+		} else {
+			my $tag = $parts[1];
+			$tag =~ s/\.md$//;
+			push(@preamble, "## Posts tagged '${tag}' ##");
+			$preamble[0] = "Title: Archives by tag: '${tag}'";
+		}
+	} elsif ($parts[0] eq 'index.md') {
+		push(@preamble,"## Archives ##");
+	} else {
+		my($yyyy,$mmm) = @parts;
+		$mmm =~ s/\.md$//;
+		push(@preamble, "## Archives: $mmm $yyyy ##");
+		$preamble[0] = "Title: Archives by month: $mmm $yyyy";
+	}
+	$preamble[0] .= " - $blogname";
+	open(OUT, "> $outfile") or die "$outfile: $!";
+	print OUT join("\n",@preamble)."\n\n";
+	print OUT join("\n",@chunks)."\n\n";
+	print OUT "{{${rootrel}footer.md}}\n";
+	close(OUT);
+	return mmd($outfile);
+}
+
+# given a source file name return the url to it on the live site
+sub site_url {
+	my($file) = @_;
+	my $uri = $file;
+	$uri =~ s/\.(md|mmd|html)$//;
+	$uri .= '.html';
+	$uri = $url_base . $uri if $url_base;
+	return $uri;
+}
+
+# return a link that points to a tag
+sub tag_link {
+	my($tag) = @_;
+	return qq{[${tag}](/archives/tags/${tag}.html)};
+}
+
+# fold tags in a post/page into the global hash of all tags
+sub process_tags {
+	my($mmd) = @_;
+	foreach my $tag ($mmd->get_tags()) {
+		$all_tags{$tag} ||= [];
+		push(@{$all_tags{$tag}}, $mmd);
+	}
+}
+
+# generate pages.md and spit out markdown for the individual pages
+sub generate_pages {
+	my($outfile,@inputs) = @_;
+	my @commands = ();
+	my @chunks = ($list_separator);
+	my @pages;
+	foreach my $pg (@inputs) {
+		my $mmd = MultimarkdownFile->new($pg);
+		next unless $mmd;
+		next if $mmd->get_meta_bool('draft') && !$show_drafts;
+		next if $mmd->get_meta_bool('if-books') && $no_books;
+		next if $mmd->get_meta_bool('if-papers') && $no_papers;
+		process_tags($mmd);
+		push(@pages,$mmd);
+	}
+	@pages = sort by_order_asc @pages;
+	foreach my $mmd (@pages) {
+		my $pg = $mmd->get_filename();
+		my $title = $mmd->get_meta('title');
+		my $name = $mmd->get_meta('name') || lc($title);
+		my $hidden = $mmd->get_meta_bool('hidden');
+		debug("page $pg: name |$name| title |$title|");
+		unless ($title) {
+			$title = $name || $pg;
+			$title =~ s/\.*$//;
+			$title = ucfirst($title);
+			warn("$pg: could not find a title, using '$title'\n");
+		}
+		my $path = $mmd->page_path();
+		push(@commands,$mmd->write_page($out_base_dir));
+		if (!$hidden && ($pg ne 'index.md')) {
+			push(@all_pages,$mmd);
+			my $uri = site_url($path);
+			my $link = $name ? $name : $title;
+			push(@chunks, "[$link]($uri)");
+			push(@chunks,$list_separator);
+		}
+	}
+	push(@chunks,"[archives](/archives/)",$list_separator);
+	chunk_out($outfile,join(' ',@chunks));
+	return @commands;
+}
+
+# generate {featured,posts}.md and the individual markdown files for each post
+sub generate_post_like_things {
+	my($group,$unit,$max_index,$outfile,@inputs) = @_;
+	my @commands = ();
+	my @chunks = ();
+	my $nposts = 0;
+	my $niposts = 0;
+	my @the_posts;
+	my $are_posts = ($group eq 'post') ? 1 : 0;
+	my($what,$writer,$summarizer,$sorter);
+	if ($are_posts) {
+		$what = 'post';
+		$writer = 'write_post';
+		$summarizer = 'post_summary';
+		$sorter = \&by_pubd_rev;
+	} else {
+		$what = $unit;
+		$writer = 'write_chapter';
+		$summarizer = 'chapter_summary';
+		$sorter = \&by_order_asc;
+	}
+	debug("postlike_things $what: are_posts=$are_posts, w=$writer, ".
+	      "outfile=$outfile s=$summarizer: @inputs");
+	## addl args for MultimarkdownFile->new()
+	my @args;
+	push(@args,'grouping',$group)	if defined($group);
+	push(@args,'unit',$unit)	if defined($unit);
+	## read all posts and sort them by whatever is appropriate
+	my $tw = 0;
+	my $tiw = 0;
+	my $tfw = 0;
+	my @featured;
+	my %feat_by_name;
+	foreach my $post (@inputs) {
+		my $mmd = MultimarkdownFile->new($post,@args);
+		next unless $mmd;
+		next if $mmd->get_meta_bool('draft') && !$show_drafts;
+		if ($mmd->get_meta_num('featured')) {
+			push(@featured,$mmd);
+			$tfw += $mmd->get_wordcount();
+			++$feat_by_name{$mmd->get_sort_title()};
+		}
+		$tw += $mmd->get_wordcount();
+		push(@the_posts,$mmd);
+		process_tags($mmd) if $are_posts;
+	}
+	## things are sorted depending on what they are: posts go
+	## backward in time, other things go forward
+	@the_posts = sort $sorter @the_posts;
+	if ($are_posts) {
+		@all_posts = @the_posts;
+	}
+	## local subs to get the physically prev,succ elements by index in
+	## @the_posts
+	my $getp = sub {
+		my($i) = @_;
+		$i ? $the_posts[$i-1] : undef;
+	};
+	my $getn = sub {
+		my($i) = @_;
+		(1+$i < scalar(@the_posts))? $the_posts[1+$i]: undef;
+	};
+	## now: what do "next" and "previous" mean in this context?
+	my($succ,$pred) = $are_posts ? ($getp,$getn) : ($getn,$getp);
+	## local sub to produce an overview of some set of post-like things
+	my $overviewer = sub {
+		my($tp,$np,$nw,$first_t,$last_t) = @_;
+		my $first_d = ts($first_t);
+		my $last_d = ts($last_t);
+		my $dates = ($first_t == $last_t) ?
+		    "on $first_d" :
+		    "between $first_d and $last_d (".
+		    elapsed($last_t-$first_t).")";
+		my $posties = plural($np,$what);
+		my $words = plural($nw,"word");
+		if ($np < $tp) {
+			$posties .= qq{ (out of $tp total)};
+		}
+		my @ov_chunks;
+		if ($are_posts) {
+			push(@ov_chunks,"*$words in $posties $dates*","");
+		} else {
+			push(@ov_chunks,"*$words in $posties*","");
+		}
+		@ov_chunks;
+	};
+	my $first_index_t;
+	my $last_index_t;
+	## spit out postlike things in order with the right dir struct
+	for (my $i = 0; $i < scalar(@the_posts); ++$i) {
+		my $mmd = $the_posts[$i];
+		my $nxt = &$succ($i);
+		my $prv = &$pred($i);
+		push(@commands,$mmd->$writer($out_base_dir,$prv,$nxt));
+		++$nposts;
+		if (!$feat_by_name{$mmd->get_sort_title()} &&
+		    (!$max_index || $nposts <= $max_index)) {
+			my $title = $mmd->get_meta('title');
+			my $t = $mmd->get_meta_date('date');
+			my $path = $mmd->post_path(".html");
+			my $url = site_url($path);
+			warn("postlike '$title' in ".
+			     $mmd->get_filename()." date is bad: ".
+			     $mmd->get_meta('date')) unless $t;
+			$first_index_t ||= $t;
+			$last_index_t ||= $t;
+			$last_index_t = $t	if $t > $last_index_t;
+			$first_index_t = $t	if $t < $first_index_t;
+			$tiw += $mmd->get_wordcount();
+			++$niposts;
+			push(@chunks,"### [$title]($url) ###","",
+			     $mmd->$summarizer(1));
+		}
+	}
+	my $featured_file = join('/', $out_base_dir, 'featured.md');
+	if (@featured) {
+		my @featured_chunks;
+		@featured = sort by_pubd_asc @featured;
+		my $first_t = $featured[0]->get_meta_date('date');
+		my $last_t = $featured[-1]->get_meta_date('date');
+		push(@featured_chunks,
+		     &$overviewer($nposts,scalar(@featured),$tfw,
+				  $first_t,$last_t),"");
+		foreach my $mmd (sort by_featured @featured) {
+			my $title = $mmd->get_meta('title');
+			my $path = $mmd->post_path(".html");
+			my $url = site_url($path);
+			push(@featured_chunks,
+			     "### [$title]($url) ###","",$mmd->$summarizer(1));
+		}
+		chunk_out($featured_file,@featured_chunks);
+	} elsif (!(-f $featured_file)) {
+		chunk_out($featured_file,"No featured ".plural($what,2));
+	}
+	if ($nposts) {
+		unshift(@chunks,
+			&$overviewer($nposts,$niposts,$tiw,
+				     $first_index_t,$last_index_t));
+	} else {
+		push(@chunks, "There are no ".plural($what,2));
+	}
+	chunk_out($outfile,@chunks);
+	return @commands;
+}
+
+# generate posts, dumped under root by date, e.g. root/yyyy/mm/dd/foo.md
+sub generate_posts {
+	return generate_post_like_things(
+		"post",undef,$max_posts_in_index,@_);
+}
+
+# generate "books", or extended pieces, with a different structure
+sub generate_book_like_things {
+	my($grouping,$unit,$outfile,@bookdirs) = @_;
+	my $grouplural = $grouping . 's';
+	my $units = $unit . 's';
+	my $outdir = join('/', $out_base_dir, $grouplural);
+	my @commands;
+	my @chunks;
+	unless (-d $outdir) {
+		mkdir($outdir) or die "mkdir($outdir): $!";
+	}
+	debug("$grouping outdir: $outdir");
+	foreach my $book (@bookdirs) {
+		my $book_outdir = join('/',$out_base_dir,$book);
+		debug("processing $grouping: $book, outdir $book_outdir");
+		unless (-d $book_outdir) {
+			mkdir($book_outdir) or die "mkdir($book_outdir): $!";
+		}
+		my $desc = "no description";
+		if (-f "$book/index.md") {
+			debug("loading $book/index.md");
+			my $mmd = MultimarkdownFile->new(
+				"$book/index.md",
+				grouping => $grouping,
+				unit => $unit
+			    );
+			$desc = $mmd->get_meta('description') ||
+			    $mmd->get_meta('title');
+			debug("read description from $book/index.md: $desc");
+			$mmd->write_chapter($out_base_dir);
+			push(@commands,mmd("${book_outdir}/index.md"));
+		} else {
+			debug("no $book/index.md to load");
+		}
+		my $name = (split('/',$book))[-1];
+		my $bookdex = join('/',$book_outdir,"${units}.md");
+		my @chapters = (grep { defined $_ }
+				map { $_ !~ /index.md/ ? $_ : undef }
+				<$book/*.md>);
+		debug("name: $name, bookdex: $bookdex, $units: @chapters");
+		push(@commands,
+		     generate_post_like_things(
+			     $grouping,$unit,0,$bookdex,@chapters));
+		push(@chunks,"[$name]($book/) - $desc","");
+	}
+	chunk_out($outfile,@chunks);
+	if (-f "$grouplural/index.md") {
+		debug("dealing with $grouplural/index.md");
+		my $mmd = MultimarkdownFile->new(
+			"$grouplural/index.md",
+			grouping => $grouping,
+			unit => $unit
+		    );
+		$mmd->write_chapter($out_base_dir);
+		push(@commands,
+		     mmd(join("/",$out_base_dir,$grouplural,"index.md")));
+	}
+	return @commands;
+}
+
+sub generate_books {
+	return generate_book_like_things("book","chapter",@_);
+}
+
+sub generate_papers {
+	return generate_book_like_things("paper","section",@_);
+}
+
+# generate the archives section
+sub generate_archives {
+	my($outdir) = @_;
+	my @commands;
+	if (!(-d $outdir)) {
+		die "could not mkdir $outdir: $!"
+		    unless mkdir($outdir);
+	}
+	## monthly archives:
+	my @entries;
+	my $last_mmm;
+	my @posts = sort by_pubd_rev @all_posts;
+	my @index;
+	my $nposts = 0;
+	my $yyyy;
+	my $last_yyyy;
+	my $mmm;
+	my $nw = 0;
+	my $tw = 0;
+	foreach my $post (@posts) {
+		$tw += $post->get_wordcount();
+	}
+	my $dt = ($posts[-1]->get_meta_date('date') -
+		  $posts[0]->get_meta_date('date'));
+	my $txt = plural($tw,"word")." in ".plural(scalar(@posts),"post").
+	    " over ".elapsed($dt);
+	## These div:xcol comments are handled by some evil sed in
+	## Makefile.  This is how we fool multimarkdown into giving us
+	## two- or three-column layouts.
+	push(@index,
+	     "*Note*: These archives only cover posts, not books or papers","")
+	    unless $no_books || $no_papers;
+	push(@index,"*$txt*","","### By Month ###","");
+	push(@index,"<!-- div:twocol -->","");
+	## local sub to flush yyyy/mmm entries into their own file
+	my $flusher = sub {
+		my $txt =
+		    "[${last_mmm} ${last_yyyy}]" .
+		    "(/archives/${last_yyyy}/${last_mmm}.html): ";
+		my $summ = plural($nw,"word")." in ".plural($nposts,"post");
+		$txt .= $summ;
+		unshift(@entries,"*$summ*","");
+		push(@index,$txt,"");
+		push(@commands,
+		     archive_chunk_out(
+			     "${outdir}/${last_yyyy}/${last_mmm}.md",
+			     @entries));
+		$last_mmm = $mmm;
+		$last_yyyy = $yyyy;
+		@entries = ();
+		$nposts = 0;
+		$nw = 0;
+	};
+	for (my $i = 0; $i < scalar(@posts); ++$i) {
+		my $post = $posts[$i];
+		my $t = $post->get_meta_date('date');
+		my @tlocal = localtime($t);
+		$yyyy = ts($t,"%Y");
+		unless (-d "${outdir}/${yyyy}") {
+			mkdir("${outdir}/${yyyy}") or
+			    die "mkdir ${outdir}/${yyyy}: $!";
+		}
+		$mmm = ts($t,"%B");
+		$last_yyyy ||= $yyyy;
+		$last_mmm  ||= $mmm;
+		&$flusher() if (($yyyy != $last_yyyy) || ($mmm ne $last_mmm));
+		++$nposts;
+		$nw += $post->get_wordcount();
+		my $title = $post->get_meta('title');
+		my $path = $post->post_path(".html");
+		my $url = site_url($path);
+		push(@entries,"### [$title]($url) ###",$post->post_summary(1));
+	}
+	&$flusher() if @entries;	# handle leftovers
+	push(@index, "<!-- /div:twocol -->","");
+
+	## by title:
+	push(@index, "", "## By Title ##", "<!-- div:twocol -->","");
+	@posts = sort by_title @all_posts;
+	foreach my $post (@posts) {
+		my $txt = $post->get_meta('title');
+		$txt .= ' ('.ts($post->get_meta_date('date')).')';
+		my $url = $post->post_path('.html');
+		push(@index, "[$txt]($url)", "");
+	}
+	push(@index, "<!-- /div:twocol -->", "");
+
+	## tags:
+	@entries = ();
+	unless (-d "${outdir}/tags") {
+		mkdir("${outdir}/tags") or die "${outdir}/tags: $!";
+	}
+	foreach my $tag (sort keys(%all_tags)) {
+		my @posts = @{$all_tags{$tag}};
+		my $tnw = 0;
+		foreach my $p (@posts) {
+			$tnw += $p->get_wordcount();
+		}
+		my $posties = plural(scalar(@posts),"post");
+		my $dt = elapsed($posts[0]->get_meta_date('date') -
+				 $posts[-1]->get_meta_date('date'));
+		my $wordies = plural($tnw,"word");
+		my @tag_entries = ("*$wordies in $posties over $dt*","");
+		foreach my $post (@posts) {
+			my $title = $post->get_meta('title');
+			my $url = $post->post_path('.html');
+			push(@tag_entries,"### [$title]($url) ###",
+			     $post->post_summary(1))
+		}
+		push(@commands,
+		     archive_chunk_out("${outdir}/tags/${tag}.md",
+				       @tag_entries));
+		push(@entries, sprintf(q{%s: %s},tag_link($tag),$posties),"");
+	}
+	if (@entries) {
+		my $taggies = plural(scalar(keys(%all_tags)),"tag");
+		push(@index,"### By Tag ###","","*$taggies*","",
+		     "<!-- div:threecol -->","",@entries,"",
+		     "<!-- /div:threecol -->");
+		push(@commands,
+		     archive_chunk_out("${outdir}/tags/index.md",@entries));
+	}
+
+	## finally, write archives/index.md last
+	push(@commands,
+	     archive_chunk_out("${outdir}/index.md",@index))
+	    if @index;
+
+	return @commands;
+}
+
+# all *.md files under given directories using File::Find
+sub mdfiles {
+	my @files;
+	my $cb = sub {
+		push(@files, $_) if $_ =~ /\.md$/ && $_ !~ /template\.md$/;
+	};
+	foreach my $dir (@_) {
+		find({wanted => $cb, no_chdir => 1}, $dir);
+	}
+	return @files;
+}
+
+########################################################################
+
+our @pages = ('index.md');
+push(@pages,(grep { $_ !~ /^.*\/template.md$/ && $_ !~ /^[#\.]/}
+	     (sort <[a-zA-Z]*.md>)))		if $bare_pages;
+push(@pages, mdfiles("pages"))			if -d "pages";
+our @posts = mdfiles("posts");
+our @books = (grep { $_ !~ /^.*\/template.md$/ }
+	      grep { defined $_ } map { -d $_ ? $_ : undef } <books/*>)
+	unless $no_books;
+our @papers = (grep { $_ !~ /^.*\/template.md$/ }
+	       grep { defined $_ } map { -d $_ ? $_ : undef } <papers/*>)
+	unless $no_papers;
+our $pages_file = join('/', $out_base_dir, 'pages.md');
+our $posts_file = join('/', $out_base_dir, 'posts.md');
+our $books_file = join('/', $out_base_dir, 'books', 'books.md');
+our $papers_file = join('/', $out_base_dir, 'papers', 'papers.md');
+our $archives_dir = join('/', $out_base_dir, 'archives');
+# populate the web-facing tree with .md files
+our @mmd_commands;
+our @cmds;
+if ($books_only) {
+	debug("*** books only");
+} else {
+	@cmds = generate_pages($pages_file,@pages);
+	push(@mmd_commands,@cmds)		if @cmds;
+	@cmds = generate_posts($posts_file,@posts);
+	push(@mmd_commands,@cmds)		if @cmds;
+	if ($dump_tags) {
+		open(TAGS, "> $dump_tags") or die "$dump_tags: $!\n";
+		my $by_uses = sub {
+			scalar(@{$all_tags{$b}}) <=> scalar(@{$all_tags{$a}})
+		};
+		my @taglist = sort $by_uses keys %all_tags;
+		my($w) = (sort { $b <=> $a } map { length($_) } @taglist);
+		foreach my $tag (@taglist) {
+			my $count = scalar(@{$all_tags{$tag}});
+			my $list = join(", ",
+					map { $_->get_meta('name') }
+					@{$all_tags{$tag}});
+			print TAGS
+			    sprintf("%*s %3d %s\n",-$w,$tag,$count,$list);
+		}
+		close(TAGS);
+	}
+	debug("tags:",
+	      map { sprintf("%s:%d",$_,scalar(@{$all_tags{$_}})) }
+	      sort keys(%all_tags));
+	@cmds = generate_archives($archives_dir);
+	push(@mmd_commands,@cmds)		if @cmds;
+}
+@cmds = generate_books($books_file,@books)	if @books;
+push(@mmd_commands,@cmds)			if @cmds;
+@cmds = generate_papers($papers_file,@papers)	if @papers;
+push(@mmd_commands,@cmds)			if @cmds;
+chunk_out(join('/', $out_base_dir, 'timestamp.md'),
+	  "*Site last updated on ".ts()."*","");
+chunk_out(join('/', $out_base_dir, 'generator.md'),
+	  "*Generated by [flog.pl](/flog.pl) v.$VERSION ([POD](/flog.html))*",
+	  "");
+
+# spit out commands needed to transform all .md -> .html
+print join("\n", @mmd_commands)."\n"		if @mmd_commands;
+
+exit(0);
+
+__END__
+
+=pod
+
+=head1 NAME
+
+flog - MultiMarkdown-based static site/blog generator
+
+=head1 SYNOPSIS
+
+flog [-vdbOBP] [-C css] [-A author] [-S count] [-T fmt] [-D dir]
+               [-U url] [-p count] [-I count] [-N blogname]
+
+=head1 DESCRIPTION
+
+Flog is a static blog generator based on MultiMarkdown.  You write the
+outer bits of your blog and each post in MultiMarkdown.  Flog will
+generate the bits of MultiMarkdown that summarize the pages and posts
+in the blog and the archives of previous posts.  The generated bits
+are meant to be pulled in to e.g. C<index.md> via MultiMarkdown file
+inclusion.  You can look at L<https://haqistan.net> for an example
+of what a Flog-generated site looks like.
+
+Flog generates MultimarkDown, not HTML.  It produces files meant to be
+included in other multimarkdown files via the file inclusion syntax:
+C<{{file}}>.  The site author has the flexibility to decide where
+these bits of generated content go and how the whole site is
+structured.  Flog takes care of generating the archives, which
+contains indices into the content by date, title and tag.
+
+Flog also spits out the C<multimarkdown> invocations that should be
+executed to create the static HTML site.  It prints them, one per
+line, on stdout.  This is the usual incantation to completely
+regenerate your site:
+
+  $ flog | sh
+
+By default the resulting tree will be placed in a subdirectory of the
+current directory called C<tmp>.  You can then tar up C<./tmp> to the
+web server docroot, or use the C<-D> option to specify another output
+directory (lke your docroot).
+
+=head2 Command-Line Options
+
+Flog accepts the following options:
+
+=over 4
+
+=item * -v
+Turn up verbosity, print debugging messages to stderr.
+
+=item * --help
+Print a usage message
+
+=item * -b
+Include "bare" pages in the current working directory; the
+default is to only use C<./index.md> and look for all other
+pages in D<pages/>.
+
+=item * -O
+Only generate books, not pages, papers or posts.
+
+=item * -B
+Do not generate books.
+
+=item * -P
+Do not generate papers.
+
+=item * -d
+Do not ignore files marked as drafts (a non-empty/zero value
+for their C<draft> metadata).
+
+=item * -A author
+Set the default author, to be used if none is present in the metadata.
+
+=item * -S count
+Max number of words in a summary paragraph.
+
+=item * -T fmt
+L<strftime(3)> format string to use for formatting dates in generated
+output.
+
+=item * -D dir
+Directory in which to store the generated site; defaults to C<./tmp>.
+
+=item * -U url
+Base URL in generate URLs.  By default there is none and generated
+URLs are relative.
+
+=item * -p count
+Max number of paragraphs in summaries.
+
+=item * -I count
+Max number of posts in the front-page index of recent posts.
+
+=item * -C css
+CSS file to use in generated files.  Default is C<flogger.css>
+
+=item * -N blogname
+Set the blog name; defaults to C<flogger> which is probably not
+right...
+
+=back
+
+=head1 OPERATION
+
+Flog generates a directory tree populated with MultiMarkdown files; we
+call this directory the docroot in what follows.  The docroot is based
+on a set of input files, also multimarkdown, which it finds by various
+means.  The directory structure and naming covention used in the
+docroot is completely different than that of the input files.
+
+The input files represent one of three kinds of things:
+
+=over 4
+
+=item * static pages (about, contact, other wiki-like content);
+
+=item * blog posts (ordered in reverse chronological order normally);
+
+=item * hierarchical documents, such as papers and books.
+
+=back
+
+All three of these different kinds of entities are realized in
+MultiMarkdown.  Flog distinguishes among them based on where they are
+in the input file tree, but it expects the same kinds of metadata in
+all of them.
+
+By convention, flog expects to be run from the root of your site's
+source tree, preferably via L<make(1)> using a simple `Makefile` such
+as that used to generate
+L<haqistan.net|https://haqistan.net/Makefile>.  Flog expect to find
+all blog posts under C<posts/>, static pages under C<pages/>, books
+under C<books/> and papers under C<papers/>.
+
+Every post, page, chapter in a book or section of a paper should have
+certain basic metadata at the top, separated by a blank line from the
+content of the posts.  There should not be any kind of title or head
+matter other than the metadata; Flog generates a title and summary for
+each file on its way to the docroot.
+
+=head2 Metadata
+
+The template I use to start something new looks like this:
+
+    Title: The Title
+    name: some-stuff
+    Date: 2016-08-05
+    Edit: 2016-08-05
+    Tags: blah
+    draft: 1
+
+    No title here.
+
+Metadata names are always compared in lowercase in flog, but are
+usually capitalized by convention in multimarkdown.
+
+The C<draft> metadata should be set (to anything) if the file in
+question is a draft; this means it is ignored under normal
+circumstances.  Drafts can made visible in the docroot with the C<-d>
+option.
+
+C<Tags> is optional, but if present should be a comma-separated list of
+tags that apply to the file (whitespace is ignored).
+
+The C<name> metadata is used to form the final filename of the
+generated multimarkdown file in the docroot.  The name of the input
+file in the filesystem is used as a default if no C<name> key is given.
+
+The C<title> metadata is used in title of the final HTML file.
+Multimarkdown does this on its own when it generates HTML.
+
+There are two dates that flog cares about: C<date> and C<edit>.
+The former is the date used to sort blog posts in time (descending).
+Filesystem metadata such as the mtime of the source file is ignored,
+only the C<date> metadata matters, so it must be present.  The C<edit>
+date is displayed in summaries.  The L<Time::ParseDate> module is used
+to parse the values, so anything that module accepts can appear as a
+value (although not all forms make sense in this context, but hey).
+
+There are two other keys that don't appear in the template that
+have meaning to flog: C<featured> and C<order>.  Both take
+integer values.  They will be covered below, as they only apply
+to certain kinds of inputs.
+
+=head2 Blog Posts
+
+Blog posts are ordered backwards by time of publication (the C<date>
+metadata).  They are found by default in the C<posts> subdirectory
+of wherever flog is run.  Flog searches for all C<*.md> files
+under C<posts> recursively, so it doesn't matter where they are.  This
+allows the site author to organize their posts using the filesystem
+in whatever way makes sense to them.
+
+In the docroot blog posts are stored under directories based on the
+date of the post.  Consider this hypothetical post, under
+C<posts/tech/why-i-do-this.md>:
+
+  Title: Why Do I Do this?
+  name: why-do-i-do-this
+  Date: 2017-06-08
+
+  ...
+
+The URI for this post would end up being
+C</2017/06/08/why-do-i-do-this.html>, even though the input file has a
+different name.
+
+
+=head2 Static Pages
+
+Static pages can be considered a very simple wiki.  Any MultiMarkdown
+files in the C<pages> subdirectory are processed and added to the
+overall list of pages, which is turned into C<pages.md> in the
+docroot, suitable for inclusion in boilerplate.
+
+=head2 Hierarchical Documents
+
+Books and papers both share a hierarchical structure and are therefore
+treated more or less the same by Flog.  The only differences are
+cosmetic: books are comprised of named chapters where as papers have
+numbered sections.  The order of chapters and sections is determined
+by the C<Order> metadata, which should be an integer.  The chapters
+and sections of books and papers are sorted by their C<Order> metadata
+in the docroot.
+
+=head1 VERSION HISTORY
+
+Z<>
+
+  0.1.13  03 Sep 2017	attila	-b => -O, new -b = $bare_pages,
+				fix -C and -N, add hidden pages
+  0.1.12  04 Jul 2017   attila  dump_tags
+  0.1.11  13 Jun 2017   attila  $ignored_meta_re, page summs, more POD
+  0.1.10  11 Jun 2017   attila  funkylinks, flog POD improvements
+  0.1.9   27 May 2017   attila  strip text for summaries, fix titles
+  0.1.8   24 May 2017   attila  Modern::Perl, $no_{books,papers}
+  0.1.7   16 Dec 2016   attila  make pages obey draft attr
+  0.1.6   26 Sep 2016   attila  add draft feature via metadata
+  0.1.5   10 Aug 2016   attila  bug: featured ^ recent
+  0.1.4   06 Aug 2016   attila  Featured posts, timestamp
+  0.1.3   04 Aug 2016   attila  Refactored for books + papers
+  0.1.2   03 Aug 2016   attila  Books
+  0.1.1   01 Aug 2016   attila  First working version
+  0.1.0   12 Jul 2016   attila  Started
+
+=cut
