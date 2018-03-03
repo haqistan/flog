@@ -46,7 +46,7 @@ sub new {
 	return bless($self,$class)->parse();
 }
 
-sub opt { #imal
+sub opt {
 	exists($_[0]->{'options'}->{$_[1]}) ?
 		$_[0]->{'options'}->{$_[1]} : $_[2];
 }
@@ -58,7 +58,7 @@ sub bq { join("\n", map { "> $_" } split(/[\r\n]+/, "@_")) . "\n" }
 sub lq {
 	my($txt,$url) = @_;
 #	::debug("txt=|$txt| url=|$url|");
-	if ($url =~ /^page:(.*)$/) {
+	if ($url =~ /^(page|wiki):(.*)$/) {
 		my $pg = $1;
 		if ($pg !~ /^\//) {
 			$pg =~ s/\s/_/gs;
@@ -91,21 +91,30 @@ sub lq {
 sub markdownify {
 	my($html) = @_;
 	my $md = $html;
+	# death to carriage returns
 	$md =~ s,\r,\n,gs;
+	# e.g. <h2>foo</h2> => ## foo ##, <h3>foo</h3> => ### foo ###
 	$md =~ s,<h(\d).*?>(.*?)</h\1>,"#" x $1." $2 "."#" x $1,gsei;
+	# both md and html links get run through lq(), above
 	$md =~ s/\[([^\]]+?)\]\(([^\)]+?)\)/lq($1,$2)/gse;
 	$md =~ s/<a href=(['"])(.*?)\1>(.+?)<\/a>/lq($3,$2)/gsei;
+	# backticks for monospace
 	$md =~ s,<tt>(.*?)</tt>,`$1`,gsi;
 #	$md =~ s,<pre [^>]+>,```,gsi;
 #	$md =~ s,</pre>,```,gsi;
+	# run blockquote blocks through bq(), above
 	$md =~ s,<blockquote>(.*?)</blockquote>,bq($1),gsei;
+	# paragraphs, breaks
 	$md =~ s,<p>,\n\n,gsi;
 	$md =~ s,</p>,\n\n,gsi;
 	$md =~ s,<br/>,\n,gsi;
 	$md =~ s,<br>,\n,gsi;
+	# get rid of <font></font> entirely
 	$md =~ s,<font[^>]+>(.*?)</font>,$1,gsi;
+	# bold, italic
 	$md =~ s,(<i>|</i>|<em>|</em>),*,gsi;
 	$md =~ s,(<b>|</b>),**,gsi;
+	# let multimarkdown do these entities properly
 	$md =~ s,&nbsp;, ,gsi;
 	$md =~ s,&amp;,&,gsi;
 #	$md =~ s,&gt;,>,gsi;
@@ -451,11 +460,11 @@ sub write_page {
 	my($self,$base_dir) = @_;
 	my $path = $self->page_path();
 	my $summ = $self->is_site_index() ? undef :
-	    sub {
-		    my($self,$fh,$rootrel) = @_;
-		    my $edit = ::ts($self->get_meta_date('edit'));
-		    print $fh "\n*Updated on ${edit}*\n\n";
-	};
+		sub {
+			my($self,$fh,$rootrel) = @_;
+			my $edit = ::ts($self->get_meta_date('edit'));
+			print $fh "\n*Updated on ${edit}*\n\n";
+		};
 	$self->write_common($base_dir,$path,undef,$summ);
 }
 
@@ -520,7 +529,7 @@ sub write_chapter {
 
 package main;
 
-# c.f. Getopt::Std pod play nice with Getopt::Std so we get decent
+# c.f. Getopt::Std POD - play nice with Getopt::Std so we get decent
 # output for --help etc.
 $Getopt::Std::STANDARD_HELP_VERSION = 1;
 sub VERSION_MESSAGE { print STDERR qq|flog v.$VERSION\n|; }
@@ -552,7 +561,7 @@ usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt]
     directory where your blog lives.  It generates a directory structure
     populated with multimarkdown files under the output base dir
     and prints out the multimarkdown commands needed to generate the
-    static site on stdout.  A typical invocation:
+    static HTML site based on that tree.  A typical invocation:
         \$ flog | sh
 __HeLP__
 }
@@ -589,24 +598,23 @@ our $ignored_meta_re = qr/^(base\s+header\s+level|latex\s+.*)$/i;
 getopts('bBOPdvA:S:T:D:U:p:t:I:C:N:', \%opts);
 $VERBOSE = $opts{'v'};
 $show_drafts = $opts{'d'};
-$max_summary_word_count = int($opts{'S'})	if defined($opts{'S'});
-$max_summary_paras = int($opts{'p'})		if defined($opts{'p'});
-$nice_datetime_fmt = $opts{'T'}			if defined($opts{'T'});
-$out_base_dir = $opts{'D'}			if defined($opts{'D'});
-$out_base_dir ||= './tmp';
-$url_base = $opts{'U'}				if defined($opts{'U'});
+$max_summary_word_count = int($opts{'S'})	if defined $opts{'S'};
+$max_summary_paras = int($opts{'p'})		if defined $opts{'p'};
+$nice_datetime_fmt = $opts{'T'}			if defined $opts{'T'};
+$out_base_dir = $opts{'D'} || './tmp';
+$url_base = $opts{'U'}				if defined $opts{'U'};
 if ($url_base) {
 	$url_base .= '/' unless $url_base =~ /\/$/;
 }
-$max_posts_in_index = int($opts{'I'})		if defined($opts{'I'});
-$blogname = $opts{'N'}				if defined($opts{'N'});
-$default_author = $opts{'A'}			if defined($opts{'A'});
-$default_css = $opts{'C'}			if defined($opts{'C'});
-$dump_tags = $opts{'t'}				if defined($opts{'t'});
-$no_papers = $opts{'P'};
-$bare_pages = $opts{'b'};
-$no_books = $opts{'B'};
-$books_only = $opts{'O'};
+$max_posts_in_index = int($opts{'I'})		if defined $opts{'I'};
+$blogname = $opts{'N'}				if defined $opts{'N'};
+$default_author = $opts{'A'}			if defined $opts{'A'};
+$default_css = $opts{'C'}			if defined $opts{'C'};
+$dump_tags = $opts{'t'}				if defined $opts{'t'};
+$no_papers = $opts{'P'}				if defined $opts{'P'};
+$bare_pages = $opts{'b'}			if defined $opts{'b'};
+$no_books = $opts{'B'}				if defined $opts{'B'};
+$books_only = $opts{'O'}			if defined $opts{'O'};
 usage("cannot specify both -O and -B")		if $no_books && $books_only;
 
 our $debug_sub = $VERBOSE ? sub { warn("# @_\n"); } : sub { };
