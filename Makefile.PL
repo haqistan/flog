@@ -23,7 +23,7 @@ sub PAIR { ( SRC(@_) => DST(@_) ) }
 
 print STDERR "flog v.$VERSION\n";
 WriteMakefile(
-	AUTHOR => 'attila <attila@stalphonsos.com>',
+	AUTHOR => 'attila <attila@haqistan.net>',
 	ABSTRACT => 'MultiMarkdown-based static site/blog generator',
 	NAME => 'flog',
 	VERSION => $VERSION,

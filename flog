@@ -2,7 +2,7 @@
 ##
 # flog - static blog generator using multimarkdown
 ##
-# Copyright (C) 2016,2017 by attila <attila@stalphonsos.com>
+# Copyright (C) 2016-2022 by attila <attila@stalphonsos.com>
 # 
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -21,6 +21,7 @@ use Modern::Perl;
 use File::Find;				# find()
 use Getopt::Std;
 use POSIX qw(floor strftime);
+use Scalar::Util qw(looks_like_number);
 use vars qw($VERBOSE $VERSION);
 
 $VERSION = '0.1.16';
@@ -31,6 +32,7 @@ $VERSION = '0.1.16';
 
 package MultimarkdownFile;
 use Modern::Perl;
+use File::Basename;
 use Time::ParseDate;
 use Scalar::Util qw(looks_like_number);
 
@@ -52,20 +54,21 @@ sub opt {
 }
 
 # helper for markdownify: blockquotify a multi-line string
-sub bq { join("\n", map { "> $_" } split(/[\r\n]+/, "@_")) . "\n" }
+sub bq { shift; join("\n", map { "> $_" } split(/[\r\n]+/, "@_")) . "\n" }
 
 # helper for markdownify: deal with funky links
 sub lq {
-	my($txt,$url) = @_;
+	my($self,$txt,$url) = @_;
 #	::debug("txt=|$txt| url=|$url|");
-	if ($url =~ /^(page|wiki):(.*)$/) {
-		my $pg = $1;
-		if ($pg !~ /^\//) {
-			$pg =~ s/\s/_/gs;
-			$url = "/${pg}";
-			$url .= ".html" unless $url =~ /\.\w+$/;
-		} else {
+	if ($url =~ /^(page|wiki|post):(.*)$/) {
+		my $pg = $2;
+		my $prefix = ($1 eq 'post')? '/by-name/': '/';
+		if ($pg =~ /^\//) {
 			$url = $pg;
+		} else {
+			$pg =~ s/\s/_/gs;
+			$url = "${prefix}${pg}";
+			$url .= ".html" unless $url =~ /\.\w+$/;
 		}
 	} elsif ($url =~ /^wiki(|pedia|quote|media|source):(.*)$/) {
 		my($site,$name) = ($1,$2);
@@ -89,21 +92,23 @@ sub lq {
 
 # deal with stray html/mmd in old posts, some of which is okay
 sub markdownify {
-	my($html) = @_;
+	my($self,$html) = @_;
 	my $md = $html;
 	# death to carriage returns
 	$md =~ s,\r,\n,gs;
 	# e.g. <h2>foo</h2> => ## foo ##, <h3>foo</h3> => ### foo ###
 	$md =~ s,<h(\d).*?>(.*?)</h\1>,"#" x $1." $2 "."#" x $1,gsei;
 	# both md and html links get run through lq(), above
-	$md =~ s/\[([^\]]+?)\]\(([^\)]+?)\)/lq($1,$2)/gse;
-	$md =~ s/<a href=(['"])(.*?)\1>(.+?)<\/a>/lq($3,$2)/gsei;
+	my $lqify = sub { $self->lq(@_) };
+	$md =~ s/\[([^\]]+?)\]\(([^\)]+?)\)/&$lqify($1,$2)/gse;
+	$md =~ s/<a href=(['"])(.*?)\1>(.+?)<\/a>/&$lqify($3,$2)/gsei;
 	# backticks for monospace
 	$md =~ s,<tt>(.*?)</tt>,`$1`,gsi;
 #	$md =~ s,<pre [^>]+>,```,gsi;
 #	$md =~ s,</pre>,```,gsi;
 	# run blockquote blocks through bq(), above
-	$md =~ s,<blockquote>(.*?)</blockquote>,bq($1),gsei;
+	my $bqify = sub { $self->bq(@_) };
+	$md =~ s,<blockquote>(.*?)</blockquote>,&$bqify($1),gsei;
 	# paragraphs, breaks
 	$md =~ s,<p>,\n\n,gsi;
 	$md =~ s,</p>,\n\n,gsi;
@@ -124,10 +129,7 @@ sub markdownify {
 
 sub get_filename { shift->{'filename'}; }
 sub is_post { shift->get_filename =~ /^posts\// }
-sub get_content {
-	my $string = join("\n", @{shift->{'content'}});
-	return markdownify($string);
-}
+sub get_content { $_[0]->markdownify(join("\n",@{$_[0]->{'content'}})) }
 
 sub get_wordcount { shift->{'wordcount'}; }
 
@@ -172,6 +174,11 @@ sub get_meta {
 }
 
 sub get_meta_date { parsedate(shift->get_meta(@_)) || 0 }
+sub age {
+	time - ($_[0]->get_meta_date('edit') //
+		$_[0]->get_meta_date('date') //
+		0); # can't fail
+}
 
 sub get_meta_num {
 	my($self,$what,$default) = @_;
@@ -272,25 +279,32 @@ sub extract_summary_para {
 	return @summ;
 }
 
-sub post_summary {
-	my($self,$do_para,$prev,$next) = @_;
-	$do_para = 0 if $self->get_meta('nosumm',0);
-	my $title = $self->get_meta('title');
+sub get_name_and_title {
+	my $self = shift;
 	my $name = $self->get_meta('name');
-	my $by = $self->get_meta('author',$::default_author);
-	my $pubd = ::ts($self->get_meta_date('date'));
-	my $edit = ::ts($self->get_meta_date('edit'));
-	my $nwords = $self->get_wordcount();
 	if (!$name) {
 		my @tmp = split(/\//,$self->get_filename());
 		$name = $tmp[-1];
 		$name =~ s/\.\w+$//;
 	}
+	return $name unless wantarray;
+	my $title = $self->get_meta('title');
 	if (!$title) {
 		$title = $name;
 		$title =~ s/-/ /;
 		$title = ucfirst($title);
 	}
+	return($name,$title);
+}
+
+sub post_summary {
+	my($self,$do_para,$prev,$next) = @_;
+	$do_para = 0 if $self->get_meta('nosumm',0);
+	my($name,$title) = $self->get_name_and_title();
+	my $by = $self->get_meta('author',$::default_author);
+	my $pubd = ::ts($self->get_meta_date('date'));
+	my $edit = ::ts($self->get_meta_date('edit'));
+	my $nwords = $self->get_wordcount();
 	my $path = $self->post_path('.html');
 	my $url = ::site_url($path);
 	my $base = qq{$nwords words by $by written on $pubd, last edit: $edit};
@@ -312,19 +326,8 @@ sub post_summary {
 sub chapter_summary {
 	my($self,$do_para,$prev,$next) = @_;
 	$do_para = 0 if $self->get_meta('nosumm',0);
-	my $title = $self->get_meta('title');
-	my $name = $self->get_meta('name');
+	my($name,$title) = $self->get_name_and_title();
 	my $nwords = $self->get_wordcount();
-	if (!$name) {
-		my @tmp = split(/\//,$self->get_filename());
-		$name = $tmp[-1];
-		$name =~ s/\.\w+$//;
-	}
-	if (!$title) {
-		$title = $name;
-		$title =~ s/-/ /;
-		$title = ucfirst($title);
-	}
 	my $path = $self->chapter_path('.html');
 	my $url = ::site_url($path);
 	my $base = qq{$nwords words};
@@ -423,9 +426,10 @@ sub thing_path {
 	my($self,$ext,$intermediate) = @_;
 	$ext ||= '.md';
 	my @inpath = split(/\//, $self->get_filename());
-	my $name = $self->get_meta('name');
-	$name ||= $inpath[-1];
-	$name =~ s/\.\w+$//;
+	my $name = $self->get_name_and_title();
+#	my $name = $self->get_meta('name');
+#	$name ||= $inpath[-1];
+#	$name =~ s/\.\w+$//;
 	my @outpath = ('');
 	shift(@inpath);
 	pop(@inpath);
@@ -471,21 +475,28 @@ sub write_page {
 sub write_post {
 	my($self,$base_dir,$prev,$next) = @_;
 	my $path = $self->post_path();
-	$self->write_common(
-		$base_dir,$path,
-		sub {
-			my($self,$fh,$rootrel) = @_;
-			my $title = $self->get_meta('title');
-			print $fh "# [$::blogname](/) #\n\n";
-			print $fh "{{${rootrel}pages.md}}\n\n";
-			print $fh "## $title ##\n";
-			print $fh join(
-				"\n",
-				$self->post_summary(0,$prev,$next)
-			    )."\n";
-			print $fh "<hr>\n\n";
-		}
-	    );
+	my $hpath = $self->post_path('.html');
+	my $hdir = dirname($hpath);
+	$hdir =~ s/^\/+//gs; # make it relative
+	my $the_name = $self->get_name_and_title();
+	return (
+		$self->write_common(
+			$base_dir,$path,
+			sub {
+				my($self,$fh,$rootrel) = @_;
+				my $title = $self->get_meta('title');
+				print $fh "# [$::blogname](/) #\n\n";
+				print $fh "{{${rootrel}pages.md}}\n\n";
+				print $fh "## $title ##\n";
+				print $fh join(
+					"\n",
+					$self->post_summary(0,$prev,$next)
+					)."\n";
+				print $fh "<hr>\n\n";
+			}
+		),
+		"(cd ${base_dir}/by-name; ln -sf ../${hdir}/${the_name}.html .)",
+	);
 }
 
 sub write_chapter {
@@ -536,8 +547,8 @@ sub VERSION_MESSAGE { print STDERR qq|flog v.$VERSION\n|; }
 sub HELP_MESSAGE {
 	print STDERR <<__HeLP__;
 purpose: static blog generator based on multimarkdown
-usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt]
-            [-C css] [-U url] [-N name] [-A author] [-t file]
+usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt] [-C css]
+            [-U url] [-N name] [-A author] [-t file] [-Y age]
   bool opts:
     -v                  verbose
     -d			show posts marked as drafts (def: no)
@@ -556,6 +567,7 @@ usage: flog [-vdbBOP] [-S int] [-P int] [-I int] [-T fmt]
     -N name             name of blog (def: flogger)
     -A author           default author (def: attila)
     -t file             dump tags sorted by use count to file
+    -Y age		oldest post on main page (def: 1y)
   usage notes:
     No args needed, required or wanted.  You run this program in the
     directory where your blog lives.  It generates a directory structure
@@ -569,6 +581,75 @@ sub usage {
         print STDERR "$0: ERROR: @_\n" if @_;
         HELP_MESSAGE();
         exit(@_ ? 1 : 0);
+}
+
+# the usual sub
+sub plural {
+	my($i,$t,$tp) = @_;
+	$tp ||= "${t}s";
+	return sprintf(qq{%d %s}, $i, ($i == 1) ? $t : $tp);
+}
+
+# the passages of the times
+our $MINUTES = 60;
+our $HOURS = $MINUTES * 60;
+our $DAYS = $HOURS * 24;
+our $WEEKS = $DAYS * 7;
+our $YEARS = $DAYS * 365;
+our %TIME_UNITS = (
+	minute => $MINUTES,
+	hour => $HOURS,
+	day => $DAYS,
+	week => $WEEKS,
+	year => $YEARS
+);
+
+# seconds => human-readable elapsed time (granularity of 1 day)
+sub elapsed {
+	my $deltat = abs(int(shift(@_)));
+	return "one day" if !$deltat;
+	my $dt = "";
+	my $tack = sub {
+		$dt .= ", " if $dt;
+		$dt .= shift;
+	};
+	foreach my $unit (qw(year week day)) {
+		my $unit_val = $TIME_UNITS{$unit};
+		if ($deltat > $unit_val) {
+			my $n = floor($deltat / $unit_val);
+			$deltat -= $n * $unit_val;
+			&$tack(plural($n,$unit)) if $n > 0;
+		}
+	}
+	$dt ||= "less than a day";
+	return $dt;
+}
+
+sub elapsed_unit_val {
+	my($str) = @_;
+	return 0 unless $str;
+	$str = lc($str);
+	$str =~ s/s$//;
+	return $TIME_UNITS{$str} // 0;
+}
+
+# parse string that elapsed() spits out into a time_t
+sub parselapsed {
+	my($elapsed) = @_;
+	my @parts = split(/,\s+/,$elapsed);
+	my $dt = 0;
+	while (defined(my $part = shift(@parts))) {
+		if ($part eq 'one day') {
+			$dt = $TIME_UNITS{day};
+		} elsif ($part eq 'less than a day') {
+			$dt = $TIME_UNITS{day}/2; # ?
+		} else {
+			my($n,$u) = split(/\s+/,$part);
+			$dt += $n * elapsed_unit_val($u)
+				if looks_like_number($n);
+		}
+	}
+	return $dt;
 }
 
 our %opts;
@@ -594,6 +675,7 @@ our $no_books = 0;
 our $show_drafts = 0;
 our $no_papers = 0;
 our $ignored_meta_re = qr/^(base\s+header\s+level|latex\s+.*)$/i;
+our $max_age_in_index = $TIME_UNITS{year}; # 1y
 
 getopts('bBOPdvA:S:T:D:U:p:t:I:C:N:', \%opts);
 $VERBOSE = $opts{'v'};
@@ -607,6 +689,7 @@ if ($url_base) {
 	$url_base .= '/' unless $url_base =~ /\/$/;
 }
 $max_posts_in_index = int($opts{'I'})		if defined $opts{'I'};
+$max_age_in_index = parselapsed($opts{'Y'})	if defined $opts{'Y'};
 $blogname = $opts{'N'}				if defined $opts{'N'};
 $default_author = $opts{'A'}			if defined $opts{'A'};
 $default_css = $opts{'C'}			if defined $opts{'C'};
@@ -634,47 +717,6 @@ sub by_order_asc{ $a->get_meta_num('order') <=> $b->get_meta_num('order') }
 sub by_title	{ $a->get_sort_title() cmp $b->get_sort_title() }
 sub by_featured { $a->get_meta_num('featured')<=>$b->get_meta_num('featured') }
 
-# the usual sub
-sub plural {
-	my($i,$t,$tp) = @_;
-	$tp ||= "${t}s";
-	return sprintf(qq{%d %s}, $i, ($i == 1) ? $t : $tp);
-}
-
-our $MINUTES = 60;
-our $HOURS = $MINUTES * 60;
-our $DAYS = $HOURS * 24;
-our $WEEKS = $DAYS * 7;
-our $YEARS = $DAYS * 365;
-
-# seconds => human-readable elapsed time (granularity of 1 day)
-sub elapsed {
-	my $deltat = abs(int(shift(@_)));
-	return "one day" if !$deltat;
-	my $dt = "";
-	my $tack = sub {
-		$dt .= ", " if $dt;
-		$dt .= shift;
-	};
-	if ($deltat > $YEARS) {
-		my $n = floor($deltat / $YEARS);
-		$deltat -= $n * $YEARS;
-		&$tack(plural($n,"year")) if $n > 0;
-	}
-	if ($deltat > $WEEKS) {
-		my $n = floor($deltat / $WEEKS);
-		$deltat -= $n * $WEEKS;
-		&$tack(plural($n,"week")) if $n > 0;
-	}
-	if ($deltat > $DAYS) {
-		my $n = floor($deltat / $DAYS);
-		$deltat -= $n * $DAYS;
-		&$tack(plural($n,"day")) if $n > 0;
-	}
-	$dt ||= "less than a day";
-	return $dt;
-}
-
 # return command to invoke multimarkdown
 sub mmd {
 	my($in,$out);
@@ -687,7 +729,7 @@ sub mmd {
 	} else {
 		die "mmd called with ".scalar(@_)." args: @_";
 	}
-	return qq{${multimarkdown} -t html ${in} > ${out}};
+	return qq{${multimarkdown} --nosmart -t html ${in} > ${out}};
 }
 
 # blow a bunch of text chunks into an output file, one chunk per line
@@ -781,7 +823,7 @@ sub generate_pages {
 	@pages = sort by_order_asc @pages;
 	foreach my $mmd (@pages) {
 		my $pg = $mmd->get_filename();
-		my $title = $mmd->get_meta('title');
+		my $title = $mmd->get_meta('title') // '';
 		my $name = $mmd->get_meta('name') || lc($title);
 		my $hidden = $mmd->get_meta_bool('hidden');
 		debug("page $pg: name |$name| title |$title|");
@@ -808,7 +850,7 @@ sub generate_pages {
 
 # generate {featured,posts}.md and the individual markdown files for each post
 sub generate_post_like_things {
-	my($group,$unit,$max_index,$outfile,@inputs) = @_;
+	my($group,$unit,$max_index,$max_age,$outfile,@inputs) = @_;
 	my @commands = ();
 	my @chunks = ();
 	my $nposts = 0;
@@ -857,6 +899,7 @@ sub generate_post_like_things {
 	@the_posts = sort $sorter @the_posts;
 	if ($are_posts) {
 		@all_posts = @the_posts;
+		push(@commands,"mkdir -p ${out_base_dir}/by-name");
 	}
 	## local subs to get the physically prev,succ elements by index in
 	## @the_posts
@@ -902,7 +945,8 @@ sub generate_post_like_things {
 		push(@commands,$mmd->$writer($out_base_dir,$prv,$nxt));
 		++$nposts;
 		if (!$feat_by_name{$mmd->get_sort_title()} &&
-		    (!$max_index || $nposts <= $max_index)) {
+		    (!$max_index || $nposts <= $max_index) &&
+		    (!$max_age || ($mmd->age() <= $max_age))) {
 			my $title = $mmd->get_meta('title');
 			my $t = $mmd->get_meta_date('date');
 			my $path = $mmd->post_path(".html");
@@ -954,7 +998,9 @@ sub generate_post_like_things {
 # generate posts, dumped under root by date, e.g. root/yyyy/mm/dd/foo.md
 sub generate_posts {
 	return generate_post_like_things(
-		"post",undef,$max_posts_in_index,@_);
+		"post",undef,$max_posts_in_index,$max_age_in_index,
+		@_
+	);
 }
 
 # generate "books", or extended pieces, with a different structure
@@ -999,7 +1045,7 @@ sub generate_book_like_things {
 		debug("name: $name, bookdex: $bookdex, $units: @chapters");
 		push(@commands,
 		     generate_post_like_things(
-			     $grouping,$unit,0,$bookdex,@chapters));
+			     $grouping,$unit,0,0,$bookdex,@chapters));
 		push(@chunks,"[$name]($book/) - $desc","");
 	}
 	chunk_out($outfile,@chunks);
@@ -1102,7 +1148,7 @@ sub generate_archives {
 	push(@index, "<!-- /div:twocol -->","");
 
 	## by title:
-	push(@index, "", "## By Title ##", "<!-- div:twocol -->","");
+	push(@index, "", "### By Title ###", "<!-- div:twocol -->","");
 	@posts = sort by_title @all_posts;
 	foreach my $post (@posts) {
 		my $txt = $post->get_meta('title');
@@ -1292,7 +1338,7 @@ Print a usage message
 =item * -b
 Include "bare" pages in the current working directory; the
 default is to only use C<./index.md> and look for all other
-pages in D<pages/>.
+pages in C<pages/>.
 
 =item * -O
 Only generate books, not pages, papers or posts.
@@ -1466,7 +1512,8 @@ in the docroot.
 
 Z<>
 
-  0.1.16  26 Apr 2018	attila	fix "generated by" url
+  0.1.16  21 Feb 2022	attila	add post: links and /by-name/
+				OOify and refactor a little
   0.1.15  04 Sep 2017	attila	fix generator.md link
   0.1.14  03 Sep 2017	attila	clerical error
   0.1.13  03 Sep 2017	attila	-b => -O, new -b = $bare_pages,
