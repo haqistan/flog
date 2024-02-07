@@ -13,8 +13,8 @@ that includes tags, static pages, featured posts, drafts, various
 kinds of structured content (books, papers), etc.  Flog is a tool
 written in Perl that does this, with minimal dependencies:
 
-* `Modern::Perl`, which surely must be a requirement everywhere in the civilized perliverse now;
-* Time::ParseDate, a part of [Time-modules](http://search.cpan.org/~muir/Time-modules/) from CPAN.
+  * `Modern::Perl`, which surely must be a requirement everywhere in the civilized perliverse now;
+  * Time::ParseDate, a part of [Time-modules](http://search.cpan.org/~muir/Time-modules/) from CPAN.
 
 If you want to see an example, the
 [haqistan.net web site](https://haqistan.net) is managed using flog.
