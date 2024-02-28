@@ -18,6 +18,7 @@
 # PERFORMANCE OF THIS SOFTWARE.
 ##
 use Modern::Perl;
+use Carp qw(croak cluck confess);
 use File::Basename;
 use File::Find;				# find()
 use Getopt::Std;
@@ -27,7 +28,7 @@ our $NO_RSS = 1;
 eval { use XML::RSS; $NO_RSS=0; };
 use vars qw($VERBOSE $VERSION);
 
-$VERSION = '0.1.21';
+$VERSION = '0.1.22';
 
 our %LNAMES = (
 	1 => 'Drafty',
@@ -46,10 +47,12 @@ our %LNAMES = (
 
 package MultimarkdownFile;
 use Modern::Perl;
+use Carp qw(confess);
 use File::Basename;
 use Time::ParseDate;
 use Scalar::Util qw(looks_like_number);
 use List::Util qw(any first);
+use overload '""' => sub { shift->{filename} };
 
 sub new {
 	my $class = shift(@_);
@@ -100,6 +103,8 @@ sub lq {
 	} elsif ($url =~ /^(man|obsdman):(.*)$/) {
 		my $pg = $2;
 		$url = "https://man.openbsd.org/$pg";
+	} elsif ($url =~ /^cpan:(.*)$/) {
+		$url = "https://metacpan.org/pod/$1";
 	} elsif ($url =~ /^youtube:(.*)$/) {
 		$url = "https://www.youtube.com/watch?v=$1";
 	} elsif ($url =~ /^github:(.*)$/) {
@@ -199,16 +204,25 @@ sub get_meta {
 }
 
 sub get_meta_date {
-	parsedate(shift->get_meta(shift)) || 0;
+	my($self,$field) = @_;
+	my $s = $self->get_meta($field);
+	my $t = parsedate($s) || 0;
+	confess($self->get_meta('name').": get_meta_date($field) => 0 !?")
+		if !$t;
+	return $t;
 #	my($self,@fields) = @_;
 #	my $t = first { $self->get_meta($_) } @fields;
 #	return $t? parsedate($t): 0;
 }
 
 sub age {
-	time - ($_[0]->get_meta_date('edit') //
-		$_[0]->get_meta_date('date') //
-		0); # can't fail
+	my($self) = @_;
+	my $n = $self->get_meta('title');
+	my $t = $self->get_meta_date('edit');
+	warn("age($n) edit not set!\n") unless $t;
+	$t ||= $self->get_meta_date('date');
+	warn("age($n) date not set!\n") unless $t;
+	return time - ($t // 0);
 }
 
 sub get_meta_num {
@@ -549,7 +563,7 @@ sub thing_path {
 	push(@outpath,&$intermediate($self)) if $intermediate;
 	push(@outpath,@inpath) if @inpath && !$self->is_post;
 	push(@outpath,"${name}${ext}");
-	::debug($self->get_filename()." thing_path($ext) ".join('/',@outpath));
+#	::debug($self->get_filename()." thing_path($ext) ".join('/',@outpath));
 	return wantarray ? @outpath : join('/',@outpath);
 }
 
@@ -774,7 +788,7 @@ sub parselapsed {
 		} elsif ($part eq 'less than a day') {
 			$dt = $TIME_UNITS{day}/2; # ?
 		} else {
-			die "parselapsed($elapsed): wth is '$part' ?";
+			croak("parselapsed($elapsed): wth is '$part' ?");
 		}
 	}
 	warn("# parselapsed($elapsed) => $dt\n") if $::VERBOSE;
@@ -835,6 +849,8 @@ $max_posts_in_index = int($opts{'I'})		if defined $opts{'I'};
 $max_age_in_index = parselapsed($opts{'Y'})	if defined $opts{'Y'};
 ($blogname,$rss_feed_file) = ($opts{'N'},$opts{'N'}.'.rss')
 						if defined $opts{'N'};
+warn("#### max_posts_in_index=$max_posts_in_index max_age=$max_age_in_index\n")
+	if $VERBOSE;
 $default_author = $opts{'A'}			if defined $opts{'A'};
 our $full_author = $default_author;
 $default_author =~ s/\s+<.*>$//			if $default_author;
@@ -851,7 +867,8 @@ $no_rss = $NO_RSS				if $NO_RSS;
 $no_archives = $opts{'a'}			if defined $opts{'a'};
 usage("cannot specify both -O and -B")		if $no_books && $books_only;
 
-our $debug_sub = $VERBOSE ? sub { warn("# @_\n"); } : sub { };
+our $debug_sub = !$VERBOSE ? sub{} :
+	sub { my $m="@_"; $m.="\n" if $m !~/\n$/; warn("# $m"); };
 sub debug { &$debug_sub(@_); }
 
 # ts [$time_t [,$fmt]]
@@ -948,7 +965,7 @@ sub mmd {
 		$out = $in;
 		$out =~ s/\.(md|mmd)$/.html/;
 	} else {
-		die "mmd called with ".scalar(@_)." args: @_";
+		croak("mmd called with ".scalar(@_)." args: @_");
 	}
 	return qq{${multimarkdown} --nosmart -t html ${in} > ${out}};
 }
@@ -1108,15 +1125,22 @@ sub generate_post_like_things {
 	my %feat_by_name;
 	foreach my $post (@inputs) {
 		my $mmd = MultimarkdownFile->new($post,@args);
+		warn("# coulds not parse $post !\n") unless $mmd;
 		next unless $mmd;
+		debug("# parsed($post) d=".$mmd->get_meta_date('date').
+			" e=".$mmd->get_meta_date('edit'));
 		next if $mmd->get_meta_bool('hidden',0);
+		debug("#... not hidden\n");
 		next if $mmd->get_meta_num('draft',0) > $show_drafts;
+		debug("#... draftiness! ".$mmd->get_meta_num('draft',0)."\n");
 		if ($mmd->get_meta_num('featured')) {
 			push(@featured,$mmd);
 			$tfw += $mmd->get_wordcount();
 			++$feat_by_name{$mmd->get_sort_title()};
 		}
-		$tw += $mmd->get_wordcount();
+		my $pw = $mmd->get_wordcount();
+		$tw += $pw;
+		debug("# pushed($post) $pw words d=".$mmd->get_meta_date('date'));
 		push(@the_posts,$mmd);
 		process_tags($mmd) if $are_posts;
 	}
@@ -1142,12 +1166,14 @@ sub generate_post_like_things {
 	## local sub to produce an overview of some set of post-like things
 	my $overviewer = sub {
 		my($tp,$np,$nw,$first_t,$last_t) = @_;
+#		confess("first_t not num: '$first_t'") unless looks_like_number($first_t);
+#		confess("last_t not num: '$last_t'") unless looks_like_number($last_t);
 		my $first_d = ts($first_t);
 		my $last_d = ts($last_t);
 		my $dates = ($first_t == $last_t) ?
-		    "on $first_d" :
-		    "between $first_d and $last_d (".
-		    elapsed($last_t-$first_t).")";
+			"on $first_d" :
+			"between $first_d and $last_d (".
+			elapsed($last_t-$first_t).")";
 		my $posties = plural($np,$what);
 		my $words = plural($nw,"word");
 		if ($np < $tp) {
@@ -1164,22 +1190,28 @@ sub generate_post_like_things {
 	my $first_index_t;
 	my $last_index_t;
 	## spit out postlike things in order with the right dir struct
+	debug("#### the_posts now has ".scalar(@the_posts)." things in it!\n");
 	for (my $i = 0; $i < scalar(@the_posts); ++$i) {
 		my $mmd = $the_posts[$i];
 		my $nxt = &$succ($i);
 		my $prv = &$pred($i);
 		push(@commands,$mmd->$writer($out_base_dir,$prv,$nxt));
 		++$nposts;
+#		debug("### pushed $i ".$mmd->get_sort_title()." age=".$mmd->age()." max=$max_age nposts=$nposts nxt=$nxt prv=$prv age=".$mmd->age().($mmd->age()>$max_age?" TOO OLD":" YUNG ENUF")."\n");
 		if (!$feat_by_name{$mmd->get_sort_title()} &&
 		    (!$max_index || $nposts <= $max_index) &&
 		    (!$max_age || ($mmd->age() <= $max_age))) {
 			my $title = $mmd->get_meta('title');
+			debug("### not feat: $title age=".$mmd->age().
+				($mmd->age()>$max_age?" TOO OLD":"YUNG")."\n");
 			my $t = $mmd->get_meta_date('date');
+			my $e = $mmd->get_meta_date('edit');
 			my $path = $mmd->post_path(".html");
 			my $url = site_url($path);
 			warn("postlike '$title' in ".
-			     $mmd->get_filename()." date is bad: ".
-			     $mmd->get_meta('date')) unless $t;
+			     $mmd->get_filename()." date is bad: $t") unless $t;
+			warn("postlike '$title' in ".
+				$mmd->get_filename()." edit is bad: $e") unless $e;
 			$first_index_t ||= $t;
 			$last_index_t ||= $t;
 			$last_index_t = $t	if $t > $last_index_t;
@@ -1189,6 +1221,8 @@ sub generate_post_like_things {
 			push(@chunks,"### [$title]($url) ###","",
 			     $mmd->$summarizer(1));
 			add_to_rss($mmd) unless $no_rss;
+		} else {
+			debug("### XXX WTF IS UP: #$i ".$mmd->get_meta('title'));
 		}
 	}
 	my $featured_file = join('/', $out_base_dir, 'featured.md');
@@ -1212,6 +1246,7 @@ sub generate_post_like_things {
 	} elsif (!(-f $featured_file)) {
 		chunk_out($featured_file,"No featured ".plural($what,2));
 	}
+	debug("## after all nposts=$nposts ".scalar(@chunks)." chunks: @chunks\n");
 	if ($nposts) {
 		unshift(@chunks,
 			&$overviewer($nposts,$niposts,$tiw,
@@ -1435,7 +1470,7 @@ sub mdfiles {
 	my @files;
 	my $cb = sub {
 		push(@files, $_)
-			if substr($_,-3) eq '.md' && $_!~/^(_|template\.md)$/;
+			if substr($_,-3) eq '.md' && $_ ne 'template.md';
 	};
 	find({wanted => $cb, no_chdir => 1}, $_) for @_;
 	return @files;
@@ -1498,7 +1533,7 @@ if ($books_only) {
 push(@mmd_commands,@cmds)			if @cmds;
 @cmds = generate_papers($papers_file,@papers)	if @papers;
 push(@mmd_commands,@cmds)			if @cmds;
-our @ts_chunks = ("*Site laste updated on ".ts()."*","");
+our @ts_chunks = ("*Site last updated on ".ts()."*","");
 our $lnm = $LNAMES{$show_drafts} // '' if $show_drafts;
 $lnm = " ($lnm)" if $lnm;
 push(@ts_chunks, "*Draftiness Level ${show_drafts}${lnm}*","")
