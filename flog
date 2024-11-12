@@ -2,7 +2,7 @@
 ##
 # flog - static blog generator using multimarkdown
 ##
-# Copyright (C) 2016-2023 by attila <attila@stalphonsos.com>
+# Copyright (C) 2016-2024 by attila <attila@stalphonsos.com>
 # 
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -28,7 +28,7 @@ our $NO_RSS = 1;
 eval { use XML::RSS; $NO_RSS=0; };
 use vars qw($VERBOSE $VERSION);
 
-$VERSION = '0.1.22';
+$VERSION = '0.1.25';
 
 our %LNAMES = (
 	1 => 'Drafty',
@@ -74,6 +74,11 @@ sub opt {
 # helper for markdownify: blockquotify a multi-line string
 sub bq { shift; join("\n", map { "> $_" } split(/[\r\n]+/, "@_")) . "\n" }
 
+sub lookup_link {
+	my($self,$linkname) = @_;
+	return $::named_links{$linkname};
+}
+
 # helper for markdownify: deal with funky links
 sub lq {
 	my($self,$txt,$url) = @_;
@@ -116,6 +121,12 @@ sub lq {
 	} elsif ($url =~ /^\@([\w\.]+\.bsky(|\.(app|social)))$/) {
 		$url = "https://$1";
 		$url .= '.app' if $url =~ /^.*\.bsky$/;
+	} elsif ($url =~ /^pg:(.*)$/) {
+		# https://www.postgresql.org/docs/current/app-psql.html
+		$url = "https://www.postgresql.org/docs/current/$1.html";
+	} elsif ($url =~ /^link:(.*)$/) {
+		my $ptr = $self->lookup_link($1);
+		$url = $ptr if $ptr;
 	}
 	return "[$txt]($url)";
 }
@@ -460,6 +471,23 @@ sub permalink {
 	return "https://${domain}/$::out_by_name/${name}.html";
 }
 
+sub sussify {
+	my($self,$stuff) = @_;
+	return undef unless $stuff;
+	my %hash = %{$self->{'meta'}};
+	$hash{summary} =
+		join(' ',
+		     $self->extract_summary_para($::max_meta_summary_word_count,
+						 $::max_meta_summary_paras));
+	$hash{description} //= '...';
+	$hash{url} = $self->permalink($::blog_domain);
+	foreach my $key (keys %hash) {
+		my $val = $hash{$key};
+		$stuff =~ s/\$$key\b/$val/gs;
+	}
+	return $stuff;
+}
+
 sub write_common {
 	my($self,$base_dir,$path,$customizer,$customizer2) = @_;
 	my $outfile = $base_dir;
@@ -512,7 +540,7 @@ sub write_common {
 	}
 	print OUT "CSS: ${rootrel}$::default_css\n" unless $saw_css;
 	# think kiwi
-	my $meter = $::includes{'meta.md'} // "{{${rootrel}meta.md}}";
+	my $meter = $self->sussify($::includes{'meta.md'}) // "{{${rootrel}meta.md}}";
 	print OUT "$meter\n\n";
 	&$customizer($self,\*OUT,$rootrel) if $customizer;
 	print OUT $self->get_content() . "\n";
@@ -618,7 +646,7 @@ sub write_post {
 				print $fh join(
 					"\n",
 					$self->post_summary(0,$prev,$next)
-					)."\n";
+				)."\n";
 				print $fh "<hr>\n\n";
 			}
 		),
@@ -652,9 +680,11 @@ sub write_chapter {
 					print $fh "## $title ##\n\n";
 				}
 			} else {
+				my $nwords = $self->get_wordcount();
 				print $fh
 				    "## [$outer](/$subdir/$outer) ##\n\n";
 				print $fh "### $title ###\n";
+				print $fh "\n*$nwords words*\n\n";
 				print $fh
 				    $self->nav_links($prev,$next,$unit)."\n";
 				print $fh "\n";
@@ -677,6 +707,7 @@ sub HELP_MESSAGE {
 	print STDERR <<__HeLP__;
 usage: flog [-avbBOPR] [-d lvl] [-S int] [-P int] [-I int] [-T fmt] [-C css]
             [-U url] [-N name] [-A author] [-t file] [-Y age] [-y byname]
+	    [-L links.txt]
   bool opts:
     -v	verbose		-b process "bare" pages	-B no books/*
     -O	ONLY books/*    -P no papers/*		-R no RSS feed or links
@@ -695,6 +726,7 @@ usage: flog [-avbBOPR] [-d lvl] [-S int] [-P int] [-I int] [-T fmt] [-C css]
     -t file             dump tags sorted by use count to file
     -Y age		oldest post on main page (def: 1y)
     -y byname		prefix for the by-name link dir (def: by-name)
+    -L file		load name:link pairs for use with link:...
   usage notes:
     No args needed or required. Run in your blog\'s git tree root. Creates a
     dir tree with multimarkdown fies (under -D) and prints cmds to stdout, e.g.
@@ -708,16 +740,32 @@ sub usage {
 }
 
 our %includes;
+our %named_links;
 
-sub load_include {
+sub load_ {
+	my $hashref = shift or die 'no hashref man';
 	my $fn = shift or die 'no filename to load_include';
+	my $parser = shift;
 	open(INC, "$fn") or die "$fn: $!";
 	local $/ = undef;
 	my $contents = <INC>;
 	close(INC);
-	my $key = basename($fn);
-	$includes{$key} = $contents;
+	if (!$parser) {
+		my $key = basename($fn);
+		$includes{$key} = $contents;
+	} else {
+		&$parser($hashref,$contents);
+	}
 }
+sub links_parser {
+	my($hashref,$contents) = @_;
+	for (split(/\n/,$contents)) {
+		my($key,$contents) = split(/\s*:\s*/,$_,2);
+		$hashref->{$key} = $contents;
+	}
+}
+sub load_include { load_(\%includes,@_) }
+sub load_links { load_(\%named_links,shift,\&links_parser) }
 
 # the usual sub
 sub plural {
@@ -800,6 +848,8 @@ our $max_summary_word_count = 40;
 our $max_summary_paras = 2;
 our $max_rss_summary_word_count = 80;
 our $max_rss_summary_paras = 3;
+our $max_meta_summary_word_count = 40;
+our $max_meta_summary_paras = 1;
 our $max_posts_in_index = 20;
 our $nice_datetime_fmt = '%Y-%m-%d';
 our $out_base_dir;
@@ -830,8 +880,8 @@ our $opt_blog_copyright;
 our $opt_blog_domain;
 our $opt_blog_image_alt;
 our $rss_feed_file = "${blogname}.rss"; 
-
-getopts('abBOPRd:vA:S:T:D:U:p:t:I:C:N:Y:y:', \%opts);
+##
+getopts('abBOPRd:vA:L:S:T:D:U:p:t:I:C:N:Y:y:', \%opts);
 $VERBOSE = $opts{'v'};
 usage("-d requires an integer arg")
 	if $opts{'d'} && !looks_like_number($opts{'d'});
@@ -866,6 +916,9 @@ warn("RSS turned OFF because XML::RSS not available; sorry for your loss...\n")
 $no_rss = $NO_RSS				if $NO_RSS;
 $no_archives = $opts{'a'}			if defined $opts{'a'};
 usage("cannot specify both -O and -B")		if $no_books && $books_only;
+our $links_file = $opts{'L'}			if defined $opts{'L'};
+$links_file //= 'links.txt';
+load_links($links_file)				if -f $links_file;
 
 our $debug_sub = !$VERBOSE ? sub{} :
 	sub { my $m="@_"; $m.="\n" if $m !~/\n$/; warn("# $m"); };
@@ -1099,16 +1152,18 @@ sub generate_post_like_things {
 	my $niposts = 0;
 	my @the_posts;
 	my $are_posts = ($group eq 'post') ? 1 : 0;
-	my($what,$writer,$summarizer,$sorter);
+	my($what,$writer,$summarizer,$sorter,$pathifier);
 	if ($are_posts) {
 		$what = 'post';
 		$writer = 'write_post';
 		$summarizer = 'post_summary';
+		$pathifier = 'post_path';
 		$sorter = \&by_pubd_rev;
 	} else {
 		$what = $unit;
 		$writer = 'write_chapter';
 		$summarizer = 'chapter_summary';
+		$pathifier = 'chapter_path';
 		$sorter = \&by_order_asc;
 	}
 	debug("postlike_things $what: are_posts=$are_posts, w=$writer, ".
@@ -1168,12 +1223,15 @@ sub generate_post_like_things {
 		my($tp,$np,$nw,$first_t,$last_t) = @_;
 #		confess("first_t not num: '$first_t'") unless looks_like_number($first_t);
 #		confess("last_t not num: '$last_t'") unless looks_like_number($last_t);
-		my $first_d = ts($first_t);
-		my $last_d = ts($last_t);
-		my $dates = ($first_t == $last_t) ?
-			"on $first_d" :
-			"between $first_d and $last_d (".
-			elapsed($last_t-$first_t).")";
+		my $dates = '';
+		if (defined($first_t) && defined($last_t)) {
+			my $first_d = ts($first_t);
+			my $last_d = ts($last_t);
+			$dates = ($first_t == $last_t) ?
+				"on $first_d" :
+				"between $first_d and $last_d (".
+				elapsed($last_t-$first_t).")";
+		}
 		my $posties = plural($np,$what);
 		my $words = plural($nw,"word");
 		if ($np < $tp) {
@@ -1206,7 +1264,7 @@ sub generate_post_like_things {
 				($mmd->age()>$max_age?" TOO OLD":"YUNG")."\n");
 			my $t = $mmd->get_meta_date('date');
 			my $e = $mmd->get_meta_date('edit');
-			my $path = $mmd->post_path(".html");
+			my $path = $mmd->$pathifier(".html");
 			my $url = site_url($path);
 			warn("postlike '$title' in ".
 			     $mmd->get_filename()." date is bad: $t") unless $t;
@@ -1659,6 +1717,18 @@ CSS file to use in generated files.  Default is C<flogger.css>
 Set the blog name; defaults to C<flogger> which is probably not
 right...
 
+=item * -L file
+Load links from file, which should be formatted as lines with
+the name of the link, a colon and the target, e.g.
+
+    openbsd: https://www.openbsd.org
+    markdown: https://markdownguide.org
+    ...
+
+It is then possible to refer to these links by name in posts
+using the (link:name) shortcut, in the same way you can easily
+link to a Twitter or Mastodon handle using a shorthand.
+
 =back
 
 =head1 OPERATION
@@ -1846,6 +1916,9 @@ structure of the files in the input.
 
 Z<>
 
+  0.1.25  19 Oct 2024	attila	fix book stuffs
+  0.1.24  19 Jul 2024	attila	fix og:... meta.md fu
+  0.1.23  19 Mar 2024	attila	add -L links.txt, link:...
   0.1.22  07 Feb 2024	attila	add -a (no_archives)
   0.1.21  12 Dec 2023	attila	merge changes from other laptop
   0.1.20  24 Jul 2023	attila	fix -Y, parselapsed, clean up

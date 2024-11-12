@@ -31,5 +31,6 @@ WriteMakefile(
 	PREREQ_PM => {
 		'Modern::Perl' => 0,
 		'Time::ParseDate' => 0,
+		'XML::RSS' => 0,
 	},
 );
