@@ -3,14 +3,14 @@
 [MultiMarkdown](https://github.com/fletcher/MultiMarkdown-5) is an
 extended version of [Markdown](https://daringfireball.net/projects/markdown/).
 Its key addition is simple `key: value` style metadata at the start
-of the file, separated from the markdown content by a blank line.  It
-also adds extended table handling, footnotes and other niceties.
+of the file, separated from the markdown content by a blank line. It
+arlso adds extended table handling, footnotes and other niceties.
 In practice you can generate web sites and very nice looking PDF
 files using `LaTeX` with little effort.
 
 The meta-data facilities are enough to do a static site/blog generator
 that includes tags, static pages, featured posts, drafts, various
-kinds of structured content (books, papers), etc.  Flog is a tool
+kinds of structured content (books, papers), etc. Flog is a tool
 written in Perl that does this, with minimal dependencies:
 
   * `Modern::Perl`, which surely must be a requirement everywhere in the civilized perliverse now;
@@ -28,3 +28,6 @@ $ perl Makefile.PL
 $ make
 $ doas make install
 ```
+
+If using [local::lib](https://metacpan.org/pod/local::lib), you
+can drop the `doas` in the terminal command.

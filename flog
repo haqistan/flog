@@ -2,7 +2,7 @@
 ##
 # flog - static blog generator using multimarkdown
 ##
-# Copyright (C) 2016-2024 by attila <attila@stalphonsos.com>
+# Copyright (C) 2016-2025 by attila <attila@stalphonsos.com>
 # 
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -28,7 +28,7 @@ our $NO_RSS = 1;
 eval { use XML::RSS; $NO_RSS=0; };
 use vars qw($VERBOSE $VERSION);
 
-$VERSION = '0.1.25';
+$VERSION = '0.1.27';
 
 our %LNAMES = (
 	1 => 'Drafty',
@@ -83,14 +83,17 @@ sub lookup_link {
 sub lq {
 	my($self,$txt,$url) = @_;
 #	::debug("txt=|$txt| url=|$url|");
-	if ($url =~ /^(page|wiki|post|tag):(.*)$/) {
+	if ($url =~ /^(page|wiki|post|tag|file):(.*)$/) {
+		my $wut = $1;
 		my $pg = $2;
 		my $prefix = '/';
-		if ($1 eq 'post') {
+		if ($wut eq 'post') {
 			$prefix = "/$::out_by_name/";
-		} elsif ($1 eq 'tag') {
+		} elsif ($wut eq 'tag') {
 			$prefix = '/archives/tags/';
-		} # else / is fine
+		} elsif ($wut eq 'file') {
+			$prefix = '/filez/';
+		}
 		if ($pg =~ /^\//) {
 			$url = $pg;
 		} else {
@@ -118,9 +121,10 @@ sub lq {
 		$url = "https://$2/@".$1;
 	} elsif ($url =~ /^\@([^\.\s]{1,15})$/) {
 		$url = "https://twitter.com/$1";
-	} elsif ($url =~ /^\@([\w\.]+\.bsky(|\.(app|social)))$/) {
-		$url = "https://$1";
-		$url .= '.app' if $url =~ /^.*\.bsky$/;
+	} elsif ($url =~ /^\@([\w\.]+)\.bsky(|\.(app|social))$/) {
+		$url = "https://bsky.app/profile/$1";
+	} elsif ($url =~ /^bsky:(.*)$/) {
+		$url = "https://bsky.app/profile/$1";
 	} elsif ($url =~ /^pg:(.*)$/) {
 		# https://www.postgresql.org/docs/current/app-psql.html
 		$url = "https://www.postgresql.org/docs/current/$1.html";
@@ -1101,7 +1105,7 @@ sub process_tags {
 sub generate_pages {
 	my($outfile,@inputs) = @_;
 	my @commands = ();
-	my @chunks = ($list_separator,"[home](/)",$list_separator);
+	my @chunks = ($list_separator,"[Home](/)",$list_separator);
 	my @pages;
 	foreach my $pg (@inputs) {
 		my $mmd = MultimarkdownFile->new($pg);
@@ -1130,14 +1134,15 @@ sub generate_pages {
 		if (!$hidden && ($pg ne 'index.md')) {
 			push(@all_pages,$mmd);
 			my $uri = site_url($path);
-			my $link = $name ? $name : $title;
+#			my $link = $name ? $name : $title;
+			my $link = $title ? $title : $name;
 			push(@chunks, "[$link]($uri)");
 			push(@chunks,$list_separator);
 		}
 	}
-	push(@chunks,"[archives](/archives/)",$list_separator)
+	push(@chunks,"[Archives](/archives/)",$list_separator)
 		unless $no_archives;
-	push(@chunks,"[rss](/$rss_feed_file)",$list_separator)
+	push(@chunks,"[RSS](/$rss_feed_file)",$list_separator)
 		unless $no_rss;
 	chunk_out($outfile,join(' ',@chunks));
 	return @commands;
@@ -1916,6 +1921,8 @@ structure of the files in the input.
 
 Z<>
 
+  0.1.27  14 Mar 2025	attila	add file:... url support
+  0.1.26  27 Nov 2024	attila	fix bsky links
   0.1.25  19 Oct 2024	attila	fix book stuffs
   0.1.24  19 Jul 2024	attila	fix og:... meta.md fu
   0.1.23  19 Mar 2024	attila	add -L links.txt, link:...
