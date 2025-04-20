@@ -34,3 +34,14 @@ WriteMakefile(
 		'XML::RSS' => 0,
 	},
 );
+
+sub MY::postamble {
+	return <<__StuFf__;
+RM_RF=rm -rf
+GARBAGE=Makefile.old
+
+realclean ::
+	\$(RM_RF) \$(GARBAGE)
+
+__StuFf__
+}
