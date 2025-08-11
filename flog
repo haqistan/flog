@@ -25,10 +25,16 @@ use Getopt::Std;
 use POSIX qw(floor strftime);
 use Scalar::Util qw(looks_like_number);
 our $NO_RSS = 1;
-eval { use XML::RSS; $NO_RSS=0; };
+eval {
+	local($SIG{__WARN__}) = sub {
+		warn("<loading RSS::XML> @_\n") if $ENV{'VERBOSE'};
+	};
+	use XML::RSS;
+	$NO_RSS=0;
+};
 use vars qw($VERBOSE $VERSION);
 
-$VERSION = '0.1.28';
+$VERSION = '0.1.29';
 
 our %LNAMES = (
 	1 => 'Drafty',
@@ -1113,6 +1119,7 @@ sub generate_pages {
 		next if $mmd->get_meta_num('draft',0) > $show_drafts;
 		next if $mmd->get_meta_bool('if-books') && $no_books;
 		next if $mmd->get_meta_bool('if-papers') && $no_papers;
+		next if $mmd->get_meta_bool('skip-navbar');
 		process_tags($mmd);
 		push(@pages,$mmd);
 	}
@@ -1748,7 +1755,7 @@ The input files represent one of three kinds of things:
 
 =over 4
 
-=item * static pages (about, contact, other wiki-like content);
+=item * named pages/wiki (about, contact, other wiki-like content);
 
 =item * blog posts (ordered in reverse chronological order normally);
 
@@ -1870,6 +1877,9 @@ synonym for C<page:...>
 =item * C<[something](tag:boring)>
 a link to the archive section posts tagged C<borking> |
 
+=item * C<[something](file:rel/path)>
+a link to a random file dropped in the C<filez> (option: C<-F subdir>) directory
+
 =item * C<[wow](wiki(pedia|quote|media|source):foo)>
 link to the appropriate WikiCommons resource
 
@@ -1885,14 +1895,26 @@ link to a github repository
 =item * C<[fuck elon must](@haqistan)>
 link to a twitter profile
 
+=item * C<[fuq el0n maybe](@profile.bsky.app)>
+link to BlueSky profile
+
+=item * C<[blah](bsky:profile)
+alternate link to BlueSky profile
+
 =item * C<[twoot](@haqistan@foo)>
 link to a mastodon profile
 
+=item * C<[SELECT](pg:SELECT)>
+link to PostgreSQL documentation on C<SELECT> (v. good, must read)
+
+=item * C<[TS](link:typescript)>
+link to named target specified in C<links.txt> (option: C<-L file>)
+
 =back
 
-=head2 Static Pages
+=head2 Named Pages
 
-Static pages can be considered a very simple wiki. Any MultiMarkdown
+Named pages can be considered a very simple wiki. Any MultiMarkdown
 files in the C<pages> subdirectory are processed and added to the
 overall list of pages, which is turned into C<pages.md> in the
 docroot. This is effectively a navbar for your pages, suitable for
@@ -1900,6 +1922,11 @@ inclusion in boilerplate. We pull C<pages.md> into every page in the
 final docroot, in the header. The C<order> metadata in pages is used
 to sort them, it should be an integer and there is no default, so it
 will cause warnings if you omit it.
+
+If you don't want a named page to appear in the navbar (which is
+generated using C<pages.md>), add a boolean meta-data named C<Skip-Navbar>
+to the top of the file. You can still refer to it, but it won't be
+listed at top.
 
 =head2 Hierarchical Documents
 
@@ -1921,6 +1948,7 @@ structure of the files in the input.
 
 Z<>
 
+  0.1.29  20 Apr 2025	attila	add Skip-Navbar metadata for wiki
   0.1.28  21 Mar 2025	attila	s/github/codeberg/
   0.1.27  14 Mar 2025	attila	add file:... url support
   0.1.26  27 Nov 2024	attila	fix bsky links
